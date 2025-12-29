@@ -372,6 +372,7 @@ async def invite_user_to_chat(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="You are not a member of this chat"
             )
+        
         # 4. Получаем приглашаемого пользователя
         user_id_str = invite_data.get("user_id")
         if not user_id_str:
@@ -395,23 +396,19 @@ async def invite_user_to_chat(
                 detail="Invited user not found"
             )
         
-        # 5. Проверяем, не является ли пользователь уже участником
-        # На этом устройстве
+        # 5. Проверяем, не является ли пользователь уже участником на этом устройстве
         if await chat_crud.is_user_chat_member(chat_id, invited_user_id, invited_user.device_id):
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="User is already a member of this chat on this device"
             )
         
-        # 6. Добавляем пользователя в чат
-        # Используем существующий метод join_chat, но с принудительным добавлением
-        join_data = ChatJoinRequest(
+        # 6. Добавляем пользователя в чат через invite_user_to_chat
+        result = await chat_crud.invite_user_to_chat(
+            chat_id=chat_id,
             user_id=invited_user_id,
-            invite_key=str(chat_id)  # Используем chat_id как invite_key для принудительного добавления
+            inviter_device_id=device_id
         )
-        
-        # Вызываем join_chat от имени приглашаемого пользователя
-        result = await chat_crud.join_chat(chat_id, join_data, invited_user.device_id) ####
         
         logger.info(f"User {invited_user.nickname} ({invited_user_id}) invited to chat {chat_id} by {inviting_user.nickname}")
         

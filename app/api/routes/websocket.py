@@ -6,6 +6,7 @@ import json
 import logging
 from datetime import datetime
 
+from app.crud.contact import ContactCRUD
 from app.websocket.manager import ConnectionManager
 from app.database import get_db
 from app.crud.user import UserCRUD
@@ -31,7 +32,7 @@ async def get_current_user(device_id: str, user_id: uuid.UUID, db: AsyncSession)
     
     return user
 
-@router.websocket("/ws/{user_id}")
+@router.websocket("/{user_id}")
 async def websocket_endpoint(
     websocket: WebSocket,
     user_id: uuid.UUID,
@@ -151,8 +152,7 @@ async def handle_chat_message(data: dict, sender_id: uuid.UUID, db: AsyncSession
         logger.error(f"Error handling chat message: {str(e)}")
 
 # app/api/routes/websocket.py
-
-async def handle_contact_request(data: dict, websocket_user_id: uuid.UUID, db: AsyncSession):
+async def handle_contact_request(data: dict, sender_id: uuid.UUID, db: AsyncSession):
     """Обработать запрос на контакт"""
     try:
         # 1. Получаем recipient_id из сообщения
@@ -164,15 +164,7 @@ async def handle_contact_request(data: dict, websocket_user_id: uuid.UUID, db: A
             
         recipient_id = uuid.UUID(recipient_id_str)
         
-        # 2. Получаем sender_id из сообщения, а не из URL!
-        sender_id_str = data.get("sender_id") or data.get("senderId")
-        if not sender_id_str:
-            # Если нет в сообщении, используем из URL (для обратной совместимости)
-            sender_id = websocket_user_id
-        else:
-            sender_id = uuid.UUID(sender_id_str)
-        
-        # 3. Проверяем, что отправитель не отправляет запрос самому себе
+        # 2. КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: Проверяем, что отправитель не отправляет запрос самому себе
         if sender_id == recipient_id:
             logger.warning(f"User {sender_id} tried to send contact request to themselves")
             # Отправляем ошибку отправителю
@@ -184,7 +176,7 @@ async def handle_contact_request(data: dict, websocket_user_id: uuid.UUID, db: A
             await manager.send_personal_message(error_msg, sender_id)
             return
         
-        # 4. Проверяем существование получателя
+        # 3. Проверяем существование получателя
         user_crud = UserCRUD(db)
         recipient = await user_crud.get_user(recipient_id)
         
@@ -199,17 +191,51 @@ async def handle_contact_request(data: dict, websocket_user_id: uuid.UUID, db: A
             await manager.send_personal_message(error_msg, sender_id)
             return
         
-        # 5. Получаем информацию об отправителе (из БД по ID из сообщения)
+        # 4. Получаем информацию об отправителе
         sender = await user_crud.get_user(sender_id)
         if not sender:
             logger.warning(f"Sender {sender_id} not found")
             return
         
-        # 6. Формируем запрос на контакт
-        request_id = data.get("request_id") or str(uuid.uuid4())
-        contact_request = {
+        # 5. Проверяем, не являются ли уже контактами
+        contact_crud = ContactCRUD(db)
+        try:
+            existing_contact = await contact_crud.get_contacts(sender_id)
+            for contact in existing_contact:
+                if contact.user_id == recipient_id:
+                    logger.warning(f"Users {sender_id} and {recipient_id} are already contacts")
+                    error_msg = {
+                        "type": "contact_request_error",
+                        "error": "Users are already contacts",
+                        "timestamp": datetime.now().isoformat()
+                    }
+                    await manager.send_personal_message(error_msg, sender_id)
+                    return
+        except:
+            pass
+        
+        # 6. Создаем запрос в БД
+        request_id = uuid.uuid4()
+        try:
+            contact_request = await contact_crud.create_contact_request(
+                from_user_id=sender_id,
+                to_user_id=recipient_id
+            )
+            request_id = contact_request.id
+        except ValueError as e:
+            logger.error(f"Failed to create contact request: {str(e)}")
+            error_msg = {
+                "type": "contact_request_error",
+                "error": str(e),
+                "timestamp": datetime.now().isoformat()
+            }
+            await manager.send_personal_message(error_msg, sender_id)
+            return
+        
+        # 7. Формируем запрос на контакт
+        contact_request_msg = {
             "type": "contact_request",
-            "request_id": request_id,
+            "request_id": str(request_id),
             "sender_id": str(sender_id),
             "sender_nickname": sender.nickname,
             "sender_public_key": sender.public_key,
@@ -218,18 +244,20 @@ async def handle_contact_request(data: dict, websocket_user_id: uuid.UUID, db: A
         
         logger.info(f"📤 Contact request: {sender.nickname} → {recipient.nickname}")
         
-        # 7. Отправляем получателю
-        await manager.send_personal_message(contact_request, recipient_id)
+        # 8. Отправляем ТОЛЬКО получателю
+        await manager.send_personal_message(contact_request_msg, recipient_id)
         
-        # 8. Отправляем подтверждение отправителю
+        # 9. Отправляем подтверждение отправителю (но не запрос!)
         await manager.send_personal_message({
             "type": "contact_request_sent",
             "recipient_id": str(recipient_id),
             "recipient_nickname": recipient.nickname,
-            "request_id": request_id,
+            "request_id": str(request_id),
             "timestamp": datetime.now().isoformat()
         }, sender_id)
-        logger.info(f"Sending contact request from {sender.nickname} ({sender_id}) to {recipient.nickname} ({recipient_id})")
+        
+        logger.info(f"✅ Contact request sent successfully")
+        
     except Exception as e:
         logger.error(f"Error handling contact request: {str(e)}")
 

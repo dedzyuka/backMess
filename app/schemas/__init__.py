@@ -11,6 +11,7 @@ from app.schemas.chat import (
     ChatMemberDetailedResponse,
     ChatMembersResponse
 )
+from app.schemas.contact import ContactListResponse,ContactRequestCreate,ContactRequestListResponse,ContactRequestResponse,ContactResponse
 
 __all__ = [
     "UserCreate", "UserResponse","UserUpdate",
@@ -18,4 +19,6 @@ __all__ = [
     "ChatJoinRequest", "ChatJoinResponse", "ChatMemberResponse",
     "ChatLeaveResponse", "ChatLeaveAllResponse", 
     "ChatMemberDetailedResponse", "ChatMembersResponse","UserPublicResponse"
+,"ContactListResponse","ContactRequestCreate","ContactRequestListResponse","ContactRequestResponse","ContactResponse"
+
 ]

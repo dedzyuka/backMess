@@ -4,8 +4,9 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 
-from app.api.routes import users_router, chats_router
+from app.api.routes import users_router, chats_router, contact_router
 from app.api.routes.websocket import router as websocket_router
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -56,6 +57,11 @@ app.include_router(
     websocket_router,
     prefix="/ws",
     tags=["websocket"]
+)
+app.include_router(
+    contact_router,
+    prefix="/api/v1/contacts",
+    tags=["contacts"]
 )
 
 @app.get("/")
