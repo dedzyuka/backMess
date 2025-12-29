@@ -1,0 +1,2267 @@
+app/__init__.py
+
+
+
+app/api/__init__.py
+
+
+
+app/api/routes/__init__.py
+
+from app.api.routes.user import router as users_router
+from app.api.routes.chat import router as chats_router
+
+__all__ = ["users_router","chats_router"]
+
+app/api/routes/chat.py
+
+# app/api/routes/chats.py
+from datetime import datetime
+import logging
+from fastapi import APIRouter, Depends, HTTPException, status, Header
+from sqlalchemy.ext.asyncio import AsyncSession
+import uuid
+
+from app.crud.user import UserCRUD
+from app.schemas.chat import (
+    ChatCreate,
+    ChatLeaveAllResponse,
+    ChatLeaveResponse,
+    ChatMemberDetailedResponse,
+    ChatMembersResponse, 
+    ChatResponse, 
+    ChatInviteResponse,
+    ChatJoinRequest,
+    ChatJoinResponse,
+    ChatDetailResponse,
+    ChatMemberResponse
+)
+from app.crud.chat import ChatCRUD
+from app.database import get_db
+# Правильный логгер
+logger = logging.getLogger(__name__)
+
+router = APIRouter()
+
+async def get_device_id(x_device_id: str = Header(..., description="Идентификатор устройства")):  # НОВАЯ DEPENDENCY!
+    return x_device_id
+
+@router.post(
+    "/",
+    response_model=ChatInviteResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Создать новый чат",
+    response_description="Чат создан и возвращен invite key"
+)
+async def create_chat(
+    chat_data: ChatCreate,
+    device_id: str = Depends(get_device_id),  # ДОБАВЛЕН device_id!
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Создание нового чата.
+    
+    - **name**: Название чата
+    - **creator_id**: UUID создателя чата
+    
+    Требует заголовок X-Device-ID с идентификатором устройства.
+    """
+    try:
+        chat_crud = ChatCRUD(db)
+        chat_invite = await chat_crud.create_chat(chat_data, device_id)  # ПЕРЕДАЕМ device_id!
+        return chat_invite
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Internal server error during chat creation"
+        )
+
+@router.post(
+    "/{chat_id}/join",
+    response_model=ChatJoinResponse,
+    summary="Присоединиться к чату по invite key",
+    response_description="Успешное присоединение к чату"
+)
+async def join_chat(
+    chat_id: uuid.UUID,
+    join_data: ChatJoinRequest,
+    device_id: str = Depends(get_device_id),  # ДОБАВЛЕН device_id!
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Присоединение к существующему чату.
+    
+    - **user_id**: UUID пользователя, который присоединяется
+    - **invite_key**: Ключ приглашения
+    
+    Требует заголовок X-Device-ID с идентификатором устройства.
+    """
+    try:
+        chat_crud = ChatCRUD(db)
+        result = await chat_crud.join_chat(chat_id, join_data, device_id)  # ПЕРЕДАЕМ device_id!
+        return result
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Internal server error during chat join"
+        )
+
+@router.get(
+    "/",
+    response_model=list[ChatResponse],
+    summary="Получить список чатов пользователя",
+    response_description="Список чатов, где пользователь является участником НА ЭТОМ УСТРОЙСТВЕ"
+)
+async def get_user_chats(
+    user_id: uuid.UUID,
+    device_id: str = Depends(get_device_id),  # ДОБАВЛЕН device_id!
+    skip: int = 0,
+    limit: int = 100,
+    db: AsyncSession = Depends(get_db)
+):
+    """Получить все чаты, в которых участвует пользователь НА ЭТОМ УСТРОЙСТВЕ"""
+    try:
+        chat_crud = ChatCRUD(db)
+        chats = await chat_crud.get_user_chats(user_id, device_id, skip=skip, limit=limit)  # ПЕРЕДАЕМ device_id!
+        
+        # Преобразуем в ChatResponse с подсчетом участников
+        chat_responses = []
+        for chat in chats:
+            members = await chat_crud.get_chat_members(chat.chat_id)
+            chat_response = ChatResponse(
+                chat_id=chat.chat_id,
+                name=chat.name,
+                creator_id=chat.creator_id,
+                created_at=chat.created_at,
+                member_count=len(members)
+            )
+            chat_responses.append(chat_response)
+        
+        return chat_responses
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Error retrieving user chats"
+        )
+
+@router.delete(
+    "/{chat_id}/leave",
+    response_model=ChatLeaveResponse,
+    summary="Выйти из чата",
+    response_description="Успешный выход из чата"
+)
+async def leave_chat(
+    chat_id: uuid.UUID,
+    user_id: uuid.UUID,  # Будем передавать как query параметр
+    device_id: str = Depends(get_device_id),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Выйти из чата.
+    
+    - **chat_id**: UUID чата
+    - **user_id**: UUID пользователя (query параметр)
+    
+    Удаляет пользователя из участников чата на этом устройстве.
+    """
+    try:
+        chat_crud = ChatCRUD(db)
+        success = await chat_crud.leave_chat(chat_id, user_id, device_id)
+        
+        return ChatLeaveResponse(
+            success=True,
+            message="Successfully left the chat",
+            chat_id=chat_id
+        )
+        
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Internal server error during chat leave"
+        )
+
+@router.delete(
+    "/leave_all",
+    response_model=ChatLeaveAllResponse,
+    summary="Выйти из всех чатов",
+    response_description="Успешный выход из всех чатов"
+)
+async def leave_all_chats(
+    user_id: uuid.UUID,  # Query параметр
+    device_id: str = Depends(get_device_id),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Выйти из всех чатов.
+    
+    - **user_id**: UUID пользователя (query параметр)
+    
+    Удаляет пользователя из всех чатов на этом устройстве.
+    """
+    try:
+        chat_crud = ChatCRUD(db)
+        result = await chat_crud.leave_all_chats(user_id, device_id)
+        
+        return ChatLeaveAllResponse(
+            success=True,
+            message=result["message"],
+            left_chats=result["left_chats"]
+        )
+        
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Internal server error during leaving all chats"
+        )
+
+@router.get(
+    "/{chat_id}/members/detailed",
+    response_model=ChatMembersResponse,  # ИСПРАВЛЕНО: ChatMembersResponse вместо ChatMemberDetailedResponse
+    summary="Получить детальный список участников чата",
+    response_description="Детальная информация об участниках чата"
+)
+async def get_chat_members_detailed(
+    chat_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db)
+):
+    """Получить детальную информацию обо всех участниках чата"""
+    try:
+        logger.info(f"API call: get_chat_members_detailed for chat {chat_id}")
+        
+        chat_crud = ChatCRUD(db)
+        
+        # Проверяем существование чата
+        chat = await chat_crud.get_chat(chat_id)
+        if not chat:
+            logger.warning(f"Chat {chat_id} not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Chat not found"
+            )
+        
+        # Получаем детальную информацию об участниках
+        members_data = await chat_crud.get_chat_members_detailed(chat_id)
+        logger.info(f"Retrieved {len(members_data)} members from database")
+        
+        # Преобразуем в response модель
+        members_response = []
+        for member in members_data:
+            try:
+                # Проверяем, что joined_at является datetime
+                joined_at = member["joined_at"]
+                if not isinstance(joined_at, datetime):
+                    logger.warning(f"Invalid joined_at type for user {member['user_id']}: {type(joined_at)}")
+                    joined_at = datetime.utcnow()
+                
+                member_response = ChatMemberDetailedResponse(
+                    user_id=member["user_id"],
+                    nickname=member["nickname"],
+                    public_key=member["public_key"],
+                    joined_at=joined_at,
+                    device_id=member["device_id"]
+                )
+                members_response.append(member_response)
+                
+            except Exception as e:
+                logger.error(f"Error processing member {member.get('user_id', 'unknown')}: {str(e)}")
+                continue  # Пропускаем проблемного пользователя
+        
+        logger.info(f"Successfully created response for {len(members_response)} members")
+        
+        return ChatMembersResponse(
+            chat_id=chat_id,
+            members=members_response,
+            total_members=len(members_response)
+        )
+        
+    except HTTPException:
+        logger.info("HTTPException raised, re-raising")
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error in get_chat_members_detailed endpoint: {str(e)}")
+        logger.error(f"Exception type: {type(e)}")
+        import traceback
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Internal server error: {str(e)}"
+        )
+
+# Дополняем существующий эндпоинт get_chat_members
+@router.get(
+    "/{chat_id}/members",
+    response_model=list[ChatMemberResponse],
+    summary="Получить участников чата (базовый список)",
+    response_description="Базовый список участников чата"
+)
+async def get_chat_members(
+    chat_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db)
+):
+    """Получить базовый список всех участников чата"""
+    try:
+        chat_crud = ChatCRUD(db)
+        members = await chat_crud.get_chat_members(chat_id)
+        
+        # Преобразуем в ChatMemberResponse
+        members_response = []
+        for member in members:
+            # TODO: Получить реальное время присоединения из ChatMember
+            member_response = ChatMemberResponse(
+                user_id=member.user_id,
+                nickname=member.nickname,
+                joined_at=datetime.now()
+            )
+            members_response.append(member_response)
+        
+        return members_response
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Error retrieving chat members"
+        )
+
+@router.post(
+    "/{chat_id}/invite",
+    response_model=dict,
+    status_code=status.HTTP_200_OK,
+    summary="Пригласить пользователя в чат",
+    response_description="Пользователь успешно приглашен в чат"
+)
+async def invite_user_to_chat(
+    chat_id: uuid.UUID,
+    invite_data: dict,
+    device_id: str = Depends(get_device_id),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Пригласить пользователя в чат.
+    
+    - **user_id**: UUID пользователя, которого приглашаем
+    - **chat_id**: UUID чата (в URL)
+    
+    Тело запроса:
+    {
+        "user_id": "uuid-пользователя"
+    }
+    
+    Требует заголовок X-Device-ID с идентификатором устройства приглашающего.
+    """
+    try:
+        chat_crud = ChatCRUD(db)
+        user_crud = UserCRUD(db)
+        
+        # 1. Проверяем существование чата
+        chat = await chat_crud.get_chat(chat_id)
+        if not chat:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Chat not found"
+            )
+        
+        # 2. Получаем приглашающего пользователя по device_id
+        inviting_user = await user_crud.get_user_by_device_id(device_id)
+        if not inviting_user:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Inviting user not found"
+            )
+        
+        # 3. Проверяем, что приглашающий является участником чата
+        if not await chat_crud.is_user_chat_member(chat_id, inviting_user.user_id, device_id):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You are not a member of this chat"
+            )
+        # 4. Получаем приглашаемого пользователя
+        user_id_str = invite_data.get("user_id")
+        if not user_id_str:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="user_id is required in request body"
+            )
+        
+        try:
+            invited_user_id = uuid.UUID(user_id_str)
+        except ValueError:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid user_id format"
+            )
+        
+        invited_user = await user_crud.get_user(invited_user_id)
+        if not invited_user:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Invited user not found"
+            )
+        
+        # 5. Проверяем, не является ли пользователь уже участником
+        # На этом устройстве
+        if await chat_crud.is_user_chat_member(chat_id, invited_user_id, invited_user.device_id):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="User is already a member of this chat on this device"
+            )
+        
+        # 6. Добавляем пользователя в чат
+        # Используем существующий метод join_chat, но с принудительным добавлением
+        join_data = ChatJoinRequest(
+            user_id=invited_user_id,
+            invite_key=str(chat_id)  # Используем chat_id как invite_key для принудительного добавления
+        )
+        
+        # Вызываем join_chat от имени приглашаемого пользователя
+        result = await chat_crud.join_chat(chat_id, join_data, invited_user.device_id) ####
+        
+        logger.info(f"User {invited_user.nickname} ({invited_user_id}) invited to chat {chat_id} by {inviting_user.nickname}")
+        
+        return {
+            "success": True,
+            "message": f"User {invited_user.nickname} successfully invited to chat",
+            "chat_id": chat_id,
+            "invited_user_id": invited_user_id,
+            "invited_user_nickname": invited_user.nickname
+        }
+        
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error inviting user to chat: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Internal server error: {str(e)}"
+        )
+
+app/api/routes/user.py
+
+# app/api/routes/user.py
+from fastapi import APIRouter, Depends, HTTPException, Query, status, Header
+from sqlalchemy.ext.asyncio import AsyncSession
+import uuid
+import logging
+
+from app.schemas.chat import ChatInviteRequest, ChatInviteResponse
+from app.schemas.user import UserCreate, UserPublicResponse, UserResponse, UserUpdate
+from app.crud.user import UserCRUD
+from app.crud.chat import ChatCRUD
+from app.database import get_db
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter()
+
+async def get_device_id(x_device_id: str = Header(..., description="Идентификатор устройства")):
+    return x_device_id
+
+@router.post(
+    "/register", 
+    response_model=UserResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Регистрация нового пользователя",
+    response_description="Пользователь успешно зарегистрирован"
+)
+async def register_user(
+    user_data: UserCreate,
+    device_id: str = Depends(get_device_id),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Регистрация анонимного пользователя в системе.
+    
+    - **nickname**: Отображаемое имя пользователя (1-50 символов)
+    - **public_key**: Публичный ключ в PEM формате для шифрования
+    - **device_id**: Идентификатор устройства (в теле запроса)
+    
+    User_id генерируется автоматически на сервере и возвращается в ответе.
+    Требует заголовок X-Device-ID с идентификатором устройства.
+    """
+    try:
+        # Проверяем, что device_id в заголовке совпадает с device_id в теле
+        if user_data.device_id != device_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Device ID in header does not match device ID in body"
+            )
+            
+        user_crud = UserCRUD(db)
+        user = await user_crud.create_user(user_data)
+        return user
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Internal server error during registration"
+        )
+
+@router.get(
+    "/me",
+    response_model=UserResponse,
+    summary="Получить текущего пользователя по device_id из заголовка",
+    response_description="Информация о текущем пользователе"
+)
+async def get_current_user(
+    device_id: str = Depends(get_device_id),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Получить информацию о текущем пользователе на основе device_id из заголовка X-Device-ID.
+    """
+    user_crud = UserCRUD(db)
+    user = await user_crud.get_user_by_device_id(device_id)
+    
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found for this device"
+        )
+    
+    return user
+
+@router.patch(
+    "/me",
+    response_model=UserResponse,
+    summary="Обновить публичный ключ текущего пользователя",
+    response_description="Пользователь успешно обновлен"
+)
+async def update_current_user_public_key(
+    user_update: UserUpdate,
+    device_id: str = Depends(get_device_id),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Обновить публичный ключ текущего пользователя.
+    
+    - **public_key**: Новый публичный ключ в PEM формате
+    """
+    user_crud = UserCRUD(db)
+    
+    # Сначала получаем пользователя
+    user = await user_crud.get_user_by_device_id(device_id)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found for this device"
+        )
+    
+    try:
+        # Обновляем публичный ключ
+        user.public_key = user_update.public_key
+        await db.commit()
+        await db.refresh(user)
+        
+        logger.info(f"User {user.nickname} ({user.user_id}) updated public key for device {device_id}")
+        return user
+    except Exception as e:
+        await db.rollback()
+        logger.error(f"Error updating user public key: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Error updating user"
+        )
+
+@router.get(
+    "/search",
+    response_model=list[UserPublicResponse],
+    summary="Поиск пользователей по частичному совпадению nickname",
+    response_description="Список пользователей, чей nickname содержит запрос"
+)
+async def search_users(
+    query: str = Query(..., min_length=1, max_length=50, description="Часть никнейма для поиска"),
+    limit: int = Query(15, ge=1, le=50, description="Лимит результатов (1-50)"),
+    offset: int = Query(0, ge=0, description="Смещение для пагинации"),
+    device_id: str = Depends(get_device_id),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Поиск пользователей по частичному совпадению nickname.
+    
+    Возвращает список пользователей, чей nickname содержит запрошенную строку.
+    
+    - **query**: Часть никнейма для поиска (регистронезависимо)
+    - **limit**: Максимальное количество результатов (по умолчанию 15, максимум 50)
+    - **offset**: Смещение для пагинации
+    
+    Требует заголовок X-Device-ID с идентификатором устройства.
+    """
+    try:
+        # Проверяем, что пользователь с таким device_id существует (авторизован)
+        user_crud = UserCRUD(db)
+        current_user = await user_crud.get_user_by_device_id(device_id)
+        
+        if not current_user:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Device not registered or unauthorized"
+            )
+        
+        # Ищем пользователей по частичному nickname
+        users = await user_crud.search_users_by_nickname_partial(
+            partial_nickname=query,
+            exclude_user_id=current_user.user_id,
+            limit=limit,
+            offset=offset
+        )
+        
+        # Преобразуем в UserPublicResponse
+        result = []
+        for user in users:
+            result.append(UserPublicResponse(
+                user_id=user.user_id,
+                nickname=user.nickname,
+                public_key=user.public_key
+            ))
+        
+        return result
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error searching users: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Internal server error during user search"
+        )
+
+@router.get(
+    "/by-device/{device_id}",
+    response_model=UserResponse,
+    summary="Получить пользователя по device_id",
+    response_description="Информация о пользователе"
+)
+async def get_user_by_device_id(
+    device_id: str,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Получить информацию о пользователе по идентификатору устройства.
+    
+    - **device_id**: Идентификатор устройства
+    """
+    user_crud = UserCRUD(db)
+    user = await user_crud.get_user_by_device_id(device_id)
+    
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found"
+        )
+    
+    return user
+
+@router.get(
+    "/by-nickname/{nickname}",
+    response_model=UserResponse,
+    summary="Получить пользователя по никнейму",
+    response_description="Информация о пользователе"
+)
+async def get_user_by_nickname(
+    nickname: str,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Получить информацию о пользователе по никнейму.
+    
+    - **nickname**: Отображаемое имя пользователя
+    """
+    user_crud = UserCRUD(db)
+    user = await user_crud.get_user_by_nickname(nickname)
+    
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found"
+        )
+    
+    return user
+
+@router.get(
+    "/{user_id}",
+    response_model=UserResponse,
+    summary="Получить пользователя по ID",
+    response_description="Информация о пользователе"
+)
+async def get_user(
+    user_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Получить информацию о пользователе по его уникальному идентификатору.
+    
+    - **user_id**: UUID пользователя
+    """
+    user_crud = UserCRUD(db)
+    user = await user_crud.get_user(user_id)
+    
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found"
+        )
+    
+    return user
+
+# Заменяем invite_user_to_chat на использование схем:
+
+@router.post(
+    "/{chat_id}/invite",
+    response_model=ChatInviteResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Пригласить пользователя в чат",
+    response_description="Пользователь успешно приглашен в чат"
+)
+async def invite_user_to_chat(
+    chat_id: uuid.UUID,
+    invite_data: ChatInviteRequest,  # Теперь используем схему
+    device_id: str = Depends(get_device_id),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Пригласить пользователя в чат.
+    
+    - **user_id**: UUID пользователя, которого приглашаем
+    
+    Требует заголовок X-Device-ID с идентификатором устройства приглашающего.
+    """
+    try:
+        chat_crud = ChatCRUD(db)
+        user_crud = UserCRUD(db)
+        
+        # 1. Проверяем существование чата
+        chat = await chat_crud.get_chat(chat_id)
+        if not chat:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Chat not found"
+            )
+        
+        # 2. Получаем приглашающего пользователя по device_id
+        inviting_user = await user_crud.get_user_by_device_id(device_id)
+        if not inviting_user:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Inviting user not found"
+            )
+        
+        # 3. Проверяем, что приглашающий является участником чата
+        if not await chat_crud.is_user_chat_member(chat_id, inviting_user.user_id, device_id):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You are not a member of this chat"
+            )
+        
+        # 4. Получаем приглашаемого пользователя
+        invited_user = await user_crud.get_user(invite_data.user_id)
+        if not invited_user:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Invited user not found"
+            )
+        
+        # 5. Проверяем, не является ли пользователь уже участником
+        if await chat_crud.is_user_chat_member(chat_id, invite_data.user_id, invited_user.device_id):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="User is already a member of this chat"
+            )
+        
+        # 6. Добавляем пользователя в чат
+        result = await chat_crud.invite_user_to_chat(
+            chat_id=chat_id,
+            user_id=invite_data.user_id,
+            inviter_device_id=device_id
+        )
+        
+        logger.info(f"User {invited_user.nickname} ({invite_data.user_id}) invited to chat {chat_id} by {inviting_user.nickname}")
+        
+        return ChatInviteResponse(
+            success=True,
+            message=f"User {invited_user.nickname} successfully invited to chat",
+            chat_id=chat_id,
+            invited_user_id=invite_data.user_id,
+            invited_user_nickname=invited_user.nickname
+        )
+        
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error inviting user to chat: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Internal server error: {str(e)}"
+        )
+
+app/api/routes/websocket.py
+
+# app/api/routes/websocket.py
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Depends
+from sqlalchemy.ext.asyncio import AsyncSession
+import uuid
+import json
+import logging
+from datetime import datetime
+
+from app.websocket.manager import ConnectionManager
+from app.database import get_db
+from app.crud.user import UserCRUD
+from app.crud.chat import ChatCRUD
+
+logger = logging.getLogger(__name__)
+router = APIRouter()
+manager = ConnectionManager()
+
+# Простая проверка пользователя
+async def get_current_user(device_id: str, user_id: uuid.UUID, db: AsyncSession):
+    """Проверяем, что пользователь существует и device_id совпадает"""
+    user_crud = UserCRUD(db)
+    user = await user_crud.get_user(user_id)
+    
+    if not user:
+        logger.warning(f"User {user_id} not found")
+        return None
+    
+    if user.device_id != device_id:
+        logger.warning(f"Device ID mismatch for user {user_id}")
+        return None
+    
+    return user
+
+@router.websocket("/ws/{user_id}")
+async def websocket_endpoint(
+    websocket: WebSocket,
+    user_id: uuid.UUID,
+    x_device_id: str = None  # Будем получать из query параметров
+):
+    """
+    WebSocket endpoint для обмена сообщениями
+    Параметры:
+    - user_id: UUID пользователя
+    - x_device_id: device_id из query параметра (?device_id=...)
+    """
+    
+    # Получаем device_id из query параметров
+    query_params = dict(websocket.query_params)
+    device_id = query_params.get("device_id") or x_device_id
+    
+    if not device_id:
+        logger.error(f"No device_id provided for user {user_id}")
+        await websocket.close(code=4003, reason="Device ID required")
+        return
+    
+    logger.info(f"WebSocket connection attempt: user={user_id}, device={device_id[:8]}...")
+    
+    # Подключаемся к WebSocket
+    await websocket.accept()
+    
+    # Проверяем пользователя
+    from app.database import AsyncSessionLocal
+    async with AsyncSessionLocal() as db:
+        user = await get_current_user(device_id, user_id, db)
+        
+        if not user:
+            logger.warning(f"Authentication failed for user {user_id}")
+            await websocket.close(code=4001, reason="Authentication failed")
+            return
+    
+    logger.info(f"✅ WebSocket connected: {user.nickname} ({user_id})")
+    
+    # Регистрируем соединение
+    await manager.connect(websocket, user_id, user.nickname)
+    
+    try:
+        while True:
+            # Получаем сообщение
+            try:
+                data = await websocket.receive_json()
+            except json.JSONDecodeError:
+                logger.error("Invalid JSON received")
+                continue
+                
+            message_type = data.get("type")
+            
+            # Обрабатываем разные типы сообщений
+            if message_type == "chat_message":
+                await handle_chat_message(data, user_id, db)
+                
+            elif message_type == "contact_request":
+                await handle_contact_request(data, user_id, db)
+                
+            elif message_type == "contact_accept":
+                await handle_contact_accept(data, user_id, db)
+                
+            elif message_type == "ping":
+                await websocket.send_json({"type": "pong", "timestamp": datetime.now().isoformat()})
+                
+            elif message_type == "message_ack":
+                await handle_message_ack(data, user_id, db)
+                
+            else:
+                logger.warning(f"Unknown message type: {message_type}")
+                
+    except WebSocketDisconnect:
+        logger.info(f"WebSocket disconnected: {user.nickname} ({user_id})")
+        await manager.disconnect(user_id)
+    except Exception as e:
+        logger.error(f"WebSocket error for user {user_id}: {str(e)}")
+        await manager.disconnect(user_id)
+
+async def handle_chat_message(data: dict, sender_id: uuid.UUID, db: AsyncSession):
+    """Обработать сообщение чата"""
+    try:
+        chat_id = uuid.UUID(data.get("chat_id"))
+        content = data.get("content")
+        message_id = data.get("message_id") or str(uuid.uuid4())
+        timestamp = data.get("timestamp") or datetime.now().isoformat()
+        
+        # Проверяем, что отправитель - участник чата
+        chat_crud = ChatCRUD(db)
+        is_member = await chat_crud.is_user_chat_member(chat_id, sender_id)
+        
+        if not is_member:
+            logger.warning(f"User {sender_id} is not a member of chat {chat_id}")
+            return
+        
+        # Получаем участников чата
+        members = await chat_crud.get_chat_members(chat_id)
+        
+        # Формируем сообщение для пересылки
+        message_to_forward = {
+            "type": "chat_message",
+            "message_id": message_id,
+            "chat_id": str(chat_id),
+            "sender_id": str(sender_id),
+            "content": content,
+            "timestamp": timestamp,
+            "encrypted": data.get("encrypted", True)
+        }
+        
+        # Отправляем всем участникам кроме отправителя
+        for member in members:
+            if member.user_id != sender_id:
+                await manager.send_personal_message(message_to_forward, member.user_id)
+        
+        logger.info(f"Message forwarded in chat {chat_id} from {sender_id}")
+        
+    except Exception as e:
+        logger.error(f"Error handling chat message: {str(e)}")
+
+# app/api/routes/websocket.py
+
+async def handle_contact_request(data: dict, websocket_user_id: uuid.UUID, db: AsyncSession):
+    """Обработать запрос на контакт"""
+    try:
+        # 1. Получаем recipient_id из сообщения
+        recipient_id_str = data.get("recipient_id") or data.get("recipientId")
+        
+        if not recipient_id_str:
+            logger.warning(f"No recipient_id in data: {data}")
+            return
+            
+        recipient_id = uuid.UUID(recipient_id_str)
+        
+        # 2. Получаем sender_id из сообщения, а не из URL!
+        sender_id_str = data.get("sender_id") or data.get("senderId")
+        if not sender_id_str:
+            # Если нет в сообщении, используем из URL (для обратной совместимости)
+            sender_id = websocket_user_id
+        else:
+            sender_id = uuid.UUID(sender_id_str)
+        
+        # 3. Проверяем, что отправитель не отправляет запрос самому себе
+        if sender_id == recipient_id:
+            logger.warning(f"User {sender_id} tried to send contact request to themselves")
+            # Отправляем ошибку отправителю
+            error_msg = {
+                "type": "contact_request_error",
+                "error": "Cannot send contact request to yourself",
+                "timestamp": datetime.now().isoformat()
+            }
+            await manager.send_personal_message(error_msg, sender_id)
+            return
+        
+        # 4. Проверяем существование получателя
+        user_crud = UserCRUD(db)
+        recipient = await user_crud.get_user(recipient_id)
+        
+        if not recipient:
+            logger.warning(f"Recipient {recipient_id} not found")
+            # Отправляем ошибку отправителю
+            error_msg = {
+                "type": "contact_request_error",
+                "error": "Recipient not found",
+                "timestamp": datetime.now().isoformat()
+            }
+            await manager.send_personal_message(error_msg, sender_id)
+            return
+        
+        # 5. Получаем информацию об отправителе (из БД по ID из сообщения)
+        sender = await user_crud.get_user(sender_id)
+        if not sender:
+            logger.warning(f"Sender {sender_id} not found")
+            return
+        
+        # 6. Формируем запрос на контакт
+        request_id = data.get("request_id") or str(uuid.uuid4())
+        contact_request = {
+            "type": "contact_request",
+            "request_id": request_id,
+            "sender_id": str(sender_id),
+            "sender_nickname": sender.nickname,
+            "sender_public_key": sender.public_key,
+            "timestamp": datetime.now().isoformat()
+        }
+        
+        logger.info(f"📤 Contact request: {sender.nickname} → {recipient.nickname}")
+        
+        # 7. Отправляем получателю
+        await manager.send_personal_message(contact_request, recipient_id)
+        
+        # 8. Отправляем подтверждение отправителю
+        await manager.send_personal_message({
+            "type": "contact_request_sent",
+            "recipient_id": str(recipient_id),
+            "recipient_nickname": recipient.nickname,
+            "request_id": request_id,
+            "timestamp": datetime.now().isoformat()
+        }, sender_id)
+        logger.info(f"Sending contact request from {sender.nickname} ({sender_id}) to {recipient.nickname} ({recipient_id})")
+    except Exception as e:
+        logger.error(f"Error handling contact request: {str(e)}")
+
+async def handle_contact_accept(data: dict, sender_id: uuid.UUID, db: AsyncSession):
+    """Обработать подтверждение контакта"""
+    try:
+        original_sender_id = uuid.UUID(data.get("original_sender_id"))
+        
+        # Получаем информацию о пользователях
+        user_crud = UserCRUD(db)
+        sender = await user_crud.get_user(sender_id)
+        original_sender = await user_crud.get_user(original_sender_id)
+        
+        if not sender or not original_sender:
+            logger.warning(f"Users not found: sender={sender_id}, original={original_sender_id}")
+            return
+        
+        # Формируем подтверждение
+        contact_accept = {
+            "type": "contact_accept",
+            "accepted_user_id": str(sender_id),
+            "accepted_nickname": sender.nickname,
+            "accepted_public_key": sender.public_key,
+            "timestamp": datetime.now().isoformat()
+        }
+        
+        # Отправляем оригинальному отправителю
+        await manager.send_personal_message(contact_accept, original_sender_id)
+        
+        logger.info(f"Contact accepted: {sender.nickname} accepted request from {original_sender.nickname}")
+        
+    except Exception as e:
+        logger.error(f"Error handling contact accept: {str(e)}")
+
+async def handle_message_ack(data: dict, ack_sender_id: uuid.UUID, db: AsyncSession):
+    """Обработать подтверждение получения сообщения"""
+    try:
+        message_id = data.get("message_id")
+        original_sender_id = uuid.UUID(data.get("original_sender_id"))
+        
+        ack_message = {
+            "type": "message_ack",
+            "message_id": message_id,
+            "ack_sender_id": str(ack_sender_id),
+            "timestamp": datetime.now().isoformat()
+        }
+        
+        # Отправляем подтверждение оригинальному отправителю
+        await manager.send_personal_message(ack_message, original_sender_id)
+        
+        logger.info(f"Message {message_id} acknowledged by {ack_sender_id}")
+        
+    except Exception as e:
+        logger.error(f"Error handling message ack: {str(e)}")
+
+
+
+
+
+app/config.py
+
+# app/config.py
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+class Settings:
+    PROJECT_NAME: str = "Anonymous Messenger"
+    VERSION: str = "1.0.0"
+    API_V1_STR: str = "/api/v1"
+    
+    # PostgreSQL
+    POSTGRES_SERVER: str = os.getenv("POSTGRES_SERVER", "localhost")
+    POSTGRES_USER: str = os.getenv("POSTGRES_USER", "postgres")
+    POSTGRES_PASSWORD: str = os.getenv("POSTGRES_PASSWORD", "")
+    POSTGRES_DB: str = os.getenv("POSTGRES_DB", "messenger_db")
+    POSTGRES_PORT: str = os.getenv("POSTGRES_PORT", "5432")
+    
+    @property
+    def DATABASE_URL(self) -> str:
+        return "postgresql+asyncpg://localhost:5432/telegram_bot"
+        # return f"postgresql+psycopg2://{self.POSTGRES_USER}:{self.POSTGRES_PASSWORD}@{self.POSTGRES_SERVER}:{self.POSTGRES_PORT}/{self.POSTGRES_DB}"
+
+settings = Settings()
+
+app/crud/__init__.py
+
+# app/crud/__init__.py
+from app.crud.user import UserCRUD
+from app.crud.chat import ChatCRUD
+
+__all__ = ["UserCRUD", "ChatCRUD"]
+
+app/crud/chat.py
+
+# app/crud/chat.py
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, and_
+from sqlalchemy.exc import SQLAlchemyError, IntegrityError
+from app.models.chat import Chat, ChatMember
+from app.models.user import User
+from app.schemas.chat import ChatCreate, ChatJoinRequest, ChatJoinResponse, ChatInviteResponse, ChatResponse
+import uuid
+import logging
+from datetime import datetime
+
+logger = logging.getLogger(__name__)
+
+class ChatCRUD:
+    def __init__(self, db: AsyncSession):
+        self.db = db
+    
+    async def get_chat(self, chat_id: uuid.UUID) -> Chat | None:
+        """Получить информацию о чате по ID"""
+        try:
+            query = select(Chat).where(Chat.chat_id == chat_id)
+            result = await self.db.execute(query)
+            return result.scalar_one_or_none()
+        except SQLAlchemyError as e:
+            logger.error(f"Error getting chat {chat_id}: {str(e)}")
+            raise
+    
+    async def create_chat(self, chat_data: ChatCreate, device_id: str) -> ChatInviteResponse:
+        """Создать новый чат и добавить создателя в участники"""
+        try:
+            # Проверяем существование пользователя-создателя
+            user_query = select(User).where(User.user_id == chat_data.creator_id)
+            user_result = await self.db.execute(user_query)
+            creator = user_result.scalar_one_or_none()
+            
+            if not creator:
+                raise ValueError(f"User with ID {chat_data.creator_id} not found")
+            
+            # Проверяем, что creator_id соответствует device_id
+            if creator.device_id != device_id:
+                raise ValueError("User device_id does not match")
+            
+            # Создаем чат
+            chat_id = uuid.uuid4()
+            db_chat = Chat(
+                chat_id=chat_id,
+                name=chat_data.name,
+                creator_id=chat_data.creator_id
+            )
+            
+            self.db.add(db_chat)
+            
+            # Добавляем создателя в участники чата с привязкой к устройству
+            db_chat_member = ChatMember(
+                chat_id=chat_id,
+                user_id=chat_data.creator_id,
+                device_id=device_id
+            )
+            self.db.add(db_chat_member)
+            
+            await self.db.commit()
+            await self.db.refresh(db_chat)
+            
+            # Генерируем invite key
+            invite_key = str(chat_id)
+            
+            logger.info(f"Chat {chat_data.name} ({chat_id}) created by user {chat_data.creator_id} on device {device_id}")
+            
+            return ChatInviteResponse(
+                chat_id=chat_id,
+                invite_key=invite_key,
+                created_at=db_chat.created_at
+            )
+            
+        except IntegrityError as e:
+            await self.db.rollback()
+            logger.error(f"Integrity error creating chat: {str(e)}")
+            raise ValueError("Chat creation failed - integrity error")
+        except SQLAlchemyError as e:
+            await self.db.rollback()
+            logger.error(f"Database error creating chat: {str(e)}")
+            raise RuntimeError("Database error during chat creation")
+        except Exception as e:
+            await self.db.rollback()
+            logger.error(f"Unexpected error creating chat: {str(e)}")
+            raise
+    
+    async def create_chat(self, chat_data: ChatCreate, device_id: str) -> ChatInviteResponse:  # ДОБАВЛЕН device_id!
+        """Создать новый чат и добавить создателя в участники"""
+        try:
+            # Проверяем существование пользователя-создателя
+            user_query = select(User).where(User.user_id == chat_data.creator_id)
+            user_result = await self.db.execute(user_query)
+            creator = user_result.scalar_one_or_none()
+            
+            if not creator:
+                raise ValueError(f"User with ID {chat_data.creator_id} not found")
+            
+            # Проверяем, что creator_id соответствует device_id
+            if creator.device_id != device_id:
+                raise ValueError("User device_id does not match")
+            
+            # Создаем чат
+            chat_id = uuid.uuid4()
+            db_chat = Chat(
+                chat_id=chat_id,
+                name=chat_data.name,
+                creator_id=chat_data.creator_id
+            )
+            
+            self.db.add(db_chat)
+            
+            # Добавляем создателя в участники чата с привязкой к устройству
+            db_chat_member = ChatMember(
+                chat_id=chat_id,
+                user_id=chat_data.creator_id,
+                device_id=device_id  # Сохраняем device_id участника
+            )
+            self.db.add(db_chat_member)
+            
+            await self.db.commit()
+            await self.db.refresh(db_chat)
+            
+            # Генерируем invite key (пока просто chat_id, потом добавим шифрование)
+            invite_key = str(chat_id)
+            
+            logger.info(f"Chat {chat_data.name} ({chat_id}) created by user {chat_data.creator_id} on device {device_id}")
+            
+            return ChatInviteResponse(
+                chat_id=chat_id,
+                invite_key=invite_key,
+                created_at=db_chat.created_at
+            )
+            
+        except IntegrityError as e:
+            await self.db.rollback()
+            logger.error(f"Integrity error creating chat: {str(e)}")
+            raise ValueError("Chat creation failed - integrity error")
+        except SQLAlchemyError as e:
+            await self.db.rollback()
+            logger.error(f"Database error creating chat: {str(e)}")
+            raise RuntimeError("Database error during chat creation")
+        except Exception as e:
+            await self.db.rollback()
+            logger.error(f"Unexpected error creating chat: {str(e)}")
+            raise
+    
+    # В app/crud/chat.py, обновляем метод join_chat или добавляем новый метод:
+
+    async def invite_user_to_chat(self, chat_id: uuid.UUID, user_id: uuid.UUID, 
+                             inviter_device_id: str, invite_key: str = None) -> dict:
+        try:
+        # Проверяем существование чата
+            chat_query = select(Chat).where(Chat.chat_id == chat_id)
+            chat_result = await self.db.execute(chat_query)
+            chat = chat_result.scalar_one_or_none()
+        
+            if not chat:
+                raise ValueError(f"Chat with ID {chat_id} not found")
+        
+        # Проверяем существование пользователя
+            user_query = select(User).where(User.user_id == user_id)
+            user_result = await self.db.execute(user_query)
+            user = user_result.scalar_one_or_none()
+        
+            if not user:
+                raise ValueError(f"User with ID {user_id} not found")
+        
+        # Проверяем, не является ли пользователь уже участником на этом устройстве
+            existing_member_query = select(ChatMember).where(
+                and_(
+                ChatMember.chat_id == chat_id, 
+                ChatMember.user_id == user_id,
+                ChatMember.device_id == user.device_id  # Проверяем именно это устройство
+                )
+            )
+            existing_member_result = await self.db.execute(existing_member_query)
+            existing_member = existing_member_result.scalar_one_or_none()
+        
+            if existing_member:
+                raise ValueError(f"User {user_id} is already a member of chat {chat_id} on this device")
+        
+        # Добавляем пользователя в участники чата с привязкой к его устройству
+            db_chat_member = ChatMember(
+                chat_id=chat_id,
+                user_id=user_id,
+                device_id=user.device_id  # Используем device_id пользователя
+            )
+        
+            self.db.add(db_chat_member)
+            await self.db.commit()
+            await self.db.refresh(db_chat_member)
+        
+            logger.info(f"User {user_id} invited to chat {chat_id} from device {inviter_device_id}")
+        
+            return {
+            "chat_id": chat_id,
+            "user_id": user_id,
+            "joined_at": db_chat_member.joined_at,
+            "status": "invited"
+        }
+        
+        except ValueError as e:
+            await self.db.rollback()
+            raise
+        except IntegrityError as e:
+            await self.db.rollback()
+            logger.error(f"Integrity error inviting user to chat: {str(e)}")
+            raise ValueError("Chat invite failed - integrity error")
+        except SQLAlchemyError as e:
+            await self.db.rollback()
+            logger.error(f"Database error inviting user to chat: {str(e)}")
+            raise RuntimeError("Database error during chat invite")
+        except Exception as e:
+            await self.db.rollback()
+            logger.error(f"Unexpected error inviting user to chat: {str(e)}")
+            raise
+    
+    async def get_user_chats(self, user_id: uuid.UUID, device_id: str, skip: int = 0, limit: int = 100) -> list[Chat]:  # ДОБАВЛЕН device_id!
+        """Получить список чатов пользователя ТОЛЬКО для этого устройства"""
+        try:
+            query = (
+                select(Chat)
+                .join(ChatMember, Chat.chat_id == ChatMember.chat_id)
+                .where(
+                    and_(
+                        ChatMember.user_id == user_id,
+                        ChatMember.device_id == device_id  # Только чаты на этом устройстве
+                    )
+                )
+                .order_by(Chat.created_at.desc())
+                .offset(skip)
+                .limit(limit)
+            )
+            result = await self.db.execute(query)
+            chats = result.scalars().all()
+            return chats
+        except SQLAlchemyError as e:
+            logger.error(f"Error getting user chats: {str(e)}")
+            raise
+    
+    async def get_chat_members(self, chat_id: uuid.UUID, device_id: str = None) -> list[User]:  # ДОБАВЛЕН device_id!
+        """Получить список участников чата (можно фильтровать по устройству)"""
+        try:
+            query = (
+                select(User)
+                .join(ChatMember, User.user_id == ChatMember.user_id)
+                .where(ChatMember.chat_id == chat_id)
+            )
+            
+            if device_id:
+                query = query.where(ChatMember.device_id == device_id)
+                
+            result = await self.db.execute(query)
+            members = result.scalars().all()
+            return members
+        except SQLAlchemyError as e:
+            logger.error(f"Error getting chat members for chat {chat_id}: {str(e)}")
+            raise
+    
+    async def is_user_chat_member(self, chat_id: uuid.UUID, user_id: uuid.UUID, device_id: str = None) -> bool:
+        try:
+            query = select(ChatMember).where(
+                (ChatMember.chat_id == chat_id) & 
+            (ChatMember.user_id == user_id)
+            )
+        
+            if device_id:
+                query = query.where(ChatMember.device_id == device_id)
+            
+            result = await self.db.execute(query)
+            return result.scalar_one_or_none() is not None
+        except SQLAlchemyError as e:
+            logger.error(f"Error checking chat membership: {str(e)}")
+            raise
+        
+    async def leave_chat(self, chat_id: uuid.UUID, user_id: uuid.UUID, device_id: str) -> bool:
+        """Выйти из чата (удалить пользователя из участников на этом устройстве)"""
+        try:
+            # Находим запись участника чата для этого устройства
+            query = select(ChatMember).where(
+                and_(
+                    ChatMember.chat_id == chat_id,
+                    ChatMember.user_id == user_id,
+                    ChatMember.device_id == device_id
+                )
+            )
+            result = await self.db.execute(query)
+            chat_member = result.scalar_one_or_none()
+            
+            if not chat_member:
+                raise ValueError(f"User {user_id} is not a member of chat {chat_id} on this device")
+            
+            # Удаляем участника
+            await self.db.delete(chat_member)
+            await self.db.commit()
+            
+            logger.info(f"User {user_id} left chat {chat_id} from device {device_id}")
+            return True
+            
+        except ValueError as e:
+            await self.db.rollback()
+            raise
+        except SQLAlchemyError as e:
+            await self.db.rollback()
+            logger.error(f"Database error leaving chat: {str(e)}")
+            raise RuntimeError("Database error during chat leave")
+        except Exception as e:
+            await self.db.rollback()
+            logger.error(f"Unexpected error leaving chat: {str(e)}")
+            raise
+
+    async def leave_all_chats(self, user_id: uuid.UUID, device_id: str) -> dict:
+        """Выйти из всех чатов (удалить пользователя из всех чатов на этом устройстве)"""
+        try:
+            # Находим все записи участника чата для этого устройства
+            query = select(ChatMember).where(
+                and_(
+                    ChatMember.user_id == user_id,
+                    ChatMember.device_id == device_id
+                )
+            )
+            result = await self.db.execute(query)
+            chat_members = result.scalars().all()
+            
+            if not chat_members:
+                return {"left_chats": 0, "message": "User is not a member of any chats on this device"}
+            
+            # Удаляем все записи
+            for chat_member in chat_members:
+                await self.db.delete(chat_member)
+            
+            await self.db.commit()
+            
+            logger.info(f"User {user_id} left all {len(chat_members)} chats from device {device_id}")
+            
+            return {
+                "left_chats": len(chat_members),
+                "message": f"Successfully left {len(chat_members)} chats"
+            }
+            
+        except SQLAlchemyError as e:
+            await self.db.rollback()
+            logger.error(f"Database error leaving all chats: {str(e)}")
+            raise RuntimeError("Database error during leaving all chats")
+        except Exception as e:
+            await self.db.rollback()
+            logger.error(f"Unexpected error leaving all chats: {str(e)}")
+            raise
+
+    async def get_chat_members_detailed(self, chat_id: uuid.UUID) -> list[dict]:
+        """Получить детальную информацию об участниках чата"""
+        try:
+            logger.info(f"Getting detailed members for chat {chat_id}")
+        
+            query = (
+            select(User, ChatMember.joined_at)
+            .join(ChatMember, User.user_id == ChatMember.user_id)
+            .where(ChatMember.chat_id == chat_id)
+        )
+        
+            logger.info(f"Executing query: {query}")
+            result = await self.db.execute(query)
+            members_data = result.all()
+        
+            logger.info(f"Found {len(members_data)} members for chat {chat_id}")
+        
+            members = []
+            for user, joined_at in members_data:
+                logger.info(f"Processing user: {user.user_id}, joined_at: {joined_at}")
+            
+                members.append({
+                "user_id": user.user_id,
+                "nickname": user.nickname,
+                "public_key": user.public_key,
+                "joined_at": joined_at,
+                "device_id": user.device_id  
+            })
+        
+            logger.info(f"Successfully processed {len(members)} members")
+            return members
+        
+        except Exception as e:
+            logger.error(f"Error in get_chat_members_detailed for chat {chat_id}: {str(e)}")
+            logger.error(f"Exception type: {type(e)}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            raise
+    
+
+app/crud/user.py
+
+# app/crud/user.py
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, update
+from sqlalchemy.exc import SQLAlchemyError, IntegrityError
+from app.models.user import User
+from app.schemas.user import UserCreate
+import uuid
+import logging
+
+logger = logging.getLogger(__name__)
+
+class UserCRUD:
+    def __init__(self, db: AsyncSession):
+        self.db = db
+    
+    async def get_user(self, user_id: uuid.UUID) -> User | None:
+        """Получить пользователя по ID"""
+        try:
+            query = select(User).where(User.user_id == user_id)
+            result = await self.db.execute(query)
+            return result.scalar_one_or_none()
+        except SQLAlchemyError as e:
+            logger.error(f"Error getting user {user_id}: {str(e)}")
+            raise
+    
+    async def get_user_by_device_id(self, device_id: str) -> User | None:
+        """Получить пользователя по device_id"""
+        try:
+            query = select(User).where(User.device_id == device_id)
+            result = await self.db.execute(query)
+            return result.scalar_one_or_none()
+        except SQLAlchemyError as e:
+            logger.error(f"Error getting user by device_id {device_id}: {str(e)}")
+            raise
+    
+    async def get_user_by_nickname(self, nickname: str) -> User | None:
+        """Получить пользователя по никнейму"""
+        try:
+            query = select(User).where(User.nickname == nickname)
+            result = await self.db.execute(query)
+            return result.scalar_one_or_none()
+        except SQLAlchemyError as e:
+            logger.error(f"Error getting user by nickname {nickname}: {str(e)}")
+            raise
+    
+    async def create_user(self, user_data: UserCreate) -> User:
+        """Создать нового пользователя"""
+        try:
+            # Проверяем, существует ли пользователь с таким device_id
+            existing_device = await self.get_user_by_device_id(user_data.device_id)
+        
+            # Проверяем, существует ли пользователь с таким nickname
+            existing_nickname = await self.get_user_by_nickname(user_data.nickname)
+        
+            # Ситуация 1: Пользователь с таким device_id уже существует
+            if existing_device:
+                # Если этот пользователь пытается зарегистрироваться под своим же nickname
+                if existing_nickname and existing_nickname.user_id == existing_device.user_id:
+                    # Обновляем public_key если нужно
+                    if existing_device.public_key != user_data.public_key:
+                        existing_device.public_key = user_data.public_key
+                        await self.db.commit()
+                        await self.db.refresh(existing_device)
+                        logger.info(f"User {existing_device.nickname} updated public key")
+                    return existing_device
+                # Если device_id существует, но с другим nickname
+                else:
+                    raise ValueError(f"Device {user_data.device_id} is already registered with another nickname")
+        
+            # Ситуация 2: Пользователь с таким nickname существует, но device_id другой
+            if existing_nickname:
+                # nickname уже занят другим устройством
+                raise ValueError(f"Nickname {user_data.nickname} is already taken by another device")
+        
+            # Ситуация 3: Создаем нового пользователя (оба параметра уникальны)
+            user_id = uuid.uuid4()
+            db_user = User(
+                user_id=user_id,
+                device_id=user_data.device_id,
+                nickname=user_data.nickname,
+                public_key=user_data.public_key
+            )
+        
+            self.db.add(db_user)
+            await self.db.commit()
+            await self.db.refresh(db_user)
+        
+            logger.info(f"User {user_data.nickname} ({user_id}) created for device {user_data.device_id}")
+            return db_user
+        
+        except IntegrityError as e:
+            await self.db.rollback()
+            logger.error(f"Integrity error creating user: {str(e)}")
+            raise ValueError("User with this device_id or nickname already exists")
+        except SQLAlchemyError as e:
+            await self.db.rollback()
+            logger.error(f"Database error creating user: {str(e)}")
+            raise RuntimeError("Database error during user creation")
+        except Exception as e:
+            await self.db.rollback()
+            logger.error(f"Unexpected error creating user: {str(e)}")
+            raise
+    
+    async def update_user_public_key(self, user_id: uuid.UUID, public_key: str) -> User | None:
+        """Обновить публичный ключ пользователя"""
+        try:
+            user = await self.get_user(user_id)
+            if not user:
+                return None
+            
+            user.public_key = public_key
+            await self.db.commit()
+            await self.db.refresh(user)
+            return user
+        except SQLAlchemyError as e:
+            await self.db.rollback()
+            logger.error(f"Error updating user {user_id}: {str(e)}")
+            raise
+    
+    async def delete_user(self, user_id: uuid.UUID) -> bool:
+        """Удалить пользователя"""
+        try:
+            user = await self.get_user(user_id)
+            if not user:
+                return False
+            
+            await self.db.delete(user)
+            await self.db.commit()
+            return True
+        except SQLAlchemyError as e:
+            await self.db.rollback()
+            logger.error(f"Error deleting user {user_id}: {str(e)}")
+            raise
+
+        
+    async def search_users_by_nickname_partial(
+    self, 
+    partial_nickname: str, 
+    exclude_user_id: uuid.UUID = None,
+    limit: int = 15,
+    offset: int = 0
+) -> list[User]:
+    
+        try:
+            query = select(User).where(
+            User.nickname.ilike(f"%{partial_nickname}%")  # Частичное совпадение, регистронезависимо
+        )
+        
+        # Исключаем текущего пользователя из результатов
+            if exclude_user_id:
+                query = query.where(User.user_id != exclude_user_id)
+        
+        # Сортируем по nickname и применяем лимит
+            query = query.order_by(User.nickname).offset(offset).limit(limit)
+        
+            result = await self.db.execute(query)
+            users = result.scalars().all()
+        
+            return users
+        
+        except SQLAlchemyError as e:
+            logger.error(f"Error searching users by partial nickname {partial_nickname}: {str(e)}")
+            raise
+
+app/database.py
+
+# app/database.py
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
+from sqlalchemy.orm import DeclarativeBase
+from app.config import settings
+
+class Base(DeclarativeBase):
+    pass
+
+# Асинхронный engine
+engine = create_async_engine(
+    settings.DATABASE_URL,
+    echo=True,  # Логирование SQL запросов (отключить в продакшене)
+    pool_size=20,
+    max_overflow=40,
+    pool_pre_ping=True,
+)
+
+# Асинхронная сессия
+AsyncSessionLocal = async_sessionmaker(
+    engine,
+    class_=AsyncSession,
+    expire_on_commit=False,
+    autoflush=False,
+    autocommit=False,
+)
+
+async def get_db() -> AsyncSession:
+    """Dependency для получения асинхронной сессии БД"""
+    async with AsyncSessionLocal() as session:
+        try:
+            yield session
+        finally:
+            await session.close()
+
+async def create_tables():
+    """Создание таблиц (для тестов/разработки)"""
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+app/main.py
+
+# app/main.py
+from datetime import datetime
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from contextlib import asynccontextmanager
+
+from app.api.routes import users_router, chats_router
+from app.api.routes.websocket import router as websocket_router
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    print("🚀 Starting Anonymous Messenger API...")
+    print("📡 WebSocket available at: ws://localhost:8000/ws/{user_id}?device_id={device_id}")
+    yield
+    # Shutdown
+    print("👋 Shutting down...")
+
+app = FastAPI(
+    title="Anonymous Messenger API",
+    description="Secure anonymous messaging platform",
+    version="1.0.0",
+    lifespan=lifespan
+)
+
+origins = [
+    "http://localhost:3000",  # React/Vue dev сервер
+    "http://127.0.0.1:3000",
+    "http://0.0.0.0:8000",
+    "http://localhost:8000",
+]
+# CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Подключаем роуты
+app.include_router(
+    users_router,
+    prefix="/api/v1/users",
+    tags=["users"]
+)
+
+app.include_router(
+    chats_router,
+    prefix="/api/v1/chats",
+    tags=["chats"]
+)
+
+# WebSocket роут
+app.include_router(
+    websocket_router,
+    prefix="/ws",
+    tags=["websocket"]
+)
+
+@app.get("/")
+async def root():
+    return {
+        "message": "Anonymous Messenger API", 
+        "status": "running",
+        "websocket": "ws://localhost:8000/ws/{user_id}?device_id={device_id}"
+    }
+
+@app.get("/health")
+async def health_check():
+    return {"status": "healthy"}
+
+@app.get("/ws-info")
+async def websocket_info():
+    """Информация о WebSocket соединениях"""
+    from app.websocket.manager import manager
+    return {
+        "online_users": len(manager.active_connections),
+        "offline_messages": sum(len(q) for q in manager.offline_messages.values())
+    }
+
+@app.get("/ws-info/stats")
+async def get_websocket_stats():
+    """Получить полную статистику WebSocket соединений"""
+    from app.websocket.manager import manager
+    
+    # Собираем статистику
+    offline_queue_sizes = {
+        str(user_id): len(messages) 
+        for user_id, messages in manager.offline_messages.items()
+    }
+    
+    return {
+        "online_users": len(manager.active_connections),
+        "total_offline_messages": sum(len(q) for q in manager.offline_messages.values()),
+        "users_with_offline_messages": len(manager.offline_messages),
+        "offline_queue_details": offline_queue_sizes,
+        "server_time": datetime.now().isoformat(),
+        "server_uptime": "not_implemented"  # Можно добавить логику отслеживания времени работы
+    }
+
+app/models/__init__.py
+
+# app/models/__init__.py
+from app.models.user import User
+from app.models.chat import Chat, ChatMember
+
+__all__ = ["User", "Chat", "ChatMember"]
+
+app/models/chat.py
+
+# app/models/chat.py
+from sqlalchemy import String, DateTime, ForeignKey, Text
+from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+import uuid
+from datetime import datetime
+from app.database import Base
+
+class Chat(Base):
+    __tablename__ = "chats"
+    
+    chat_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), 
+        primary_key=True, 
+        default=uuid.uuid4
+    )
+    name: Mapped[str] = mapped_column(
+        String(100), 
+        nullable=False
+    )
+    creator_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), 
+        ForeignKey("users.user_id"), 
+        nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, 
+        default=datetime.now, 
+        nullable=False
+    )
+    
+    # Relationships
+    members = relationship("ChatMember", back_populates="chat", cascade="all, delete-orphan")
+    creator = relationship("User")
+
+class ChatMember(Base):
+    __tablename__ = "chat_members"
+    
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), 
+        primary_key=True, 
+        default=uuid.uuid4
+    )
+    chat_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), 
+        ForeignKey("chats.chat_id"), 
+        nullable=False
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), 
+        ForeignKey("users.user_id"), 
+        nullable=False
+    )
+    device_id: Mapped[str] = mapped_column(  # НОВОЕ ПОЛЕ! Привязка к конкретному устройству
+        String(255), 
+        nullable=False,
+        index=True
+    )
+    joined_at: Mapped[datetime] = mapped_column(
+        DateTime, 
+        default=datetime.utcnow, 
+        nullable=False
+    )
+    
+    # Relationships
+    chat = relationship("Chat", back_populates="members")
+    user = relationship("User")
+
+app/models/user.py
+
+# app/models/user.py
+from sqlalchemy import String, DateTime, Text
+from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.orm import Mapped, mapped_column
+import uuid
+from datetime import datetime
+from app.database import Base
+
+class User(Base):
+    __tablename__ = "users"
+    
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), 
+        primary_key=True, 
+        default=uuid.uuid4
+    )
+    device_id: Mapped[str] = mapped_column(  # НОВОЕ ПОЛЕ!
+        String(255), 
+        nullable=False, 
+        unique=True,
+        index=True,
+        default="Error"
+    )
+    nickname: Mapped[str] = mapped_column(
+        String(50), 
+        nullable=False, 
+        index=True
+    )
+    public_key: Mapped[str] = mapped_column(
+        Text, 
+        nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, 
+        default=datetime.utcnow, 
+        nullable=False, 
+        index=True
+    )
+    
+    def __repr__(self):
+        return f"<User {self.nickname} ({self.user_id})>"
+
+app/schemas/__init__.py
+
+from app.schemas.user import UserCreate, UserResponse,UserUpdate,UserPublicResponse
+from app.schemas.chat import (
+    ChatCreate, 
+    ChatResponse, 
+    ChatInviteResponse,
+    ChatJoinRequest, 
+    ChatJoinResponse,
+    ChatMemberResponse,
+    ChatLeaveResponse,
+    ChatLeaveAllResponse,
+    ChatMemberDetailedResponse,
+    ChatMembersResponse
+)
+
+__all__ = [
+    "UserCreate", "UserResponse","UserUpdate",
+    "ChatCreate", "ChatResponse", "ChatInviteResponse",
+    "ChatJoinRequest", "ChatJoinResponse", "ChatMemberResponse",
+    "ChatLeaveResponse", "ChatLeaveAllResponse", 
+    "ChatMemberDetailedResponse", "ChatMembersResponse","UserPublicResponse"
+]
+
+
+app/schemas/chat.py
+
+# app/schemas/chat.py
+from pydantic import BaseModel, Field
+from typing import Optional, List
+import uuid
+from datetime import datetime
+
+class ChatBase(BaseModel):
+    name: str = Field(..., min_length=1, max_length=100, description="Название чата")
+
+class ChatCreate(ChatBase):
+    creator_id: uuid.UUID = Field(..., description="UUID создателя чата")
+
+class ChatResponse(ChatBase):
+    chat_id: uuid.UUID
+    creator_id: uuid.UUID
+    created_at: datetime
+    member_count: int = Field(..., description="Количество участников")
+    
+    class Config:
+        from_attributes = True
+
+class ChatInviteResponse(BaseModel):
+    chat_id: uuid.UUID
+    invite_key: str = Field(..., description="Ключ для приглашения в чат")
+    created_at: datetime
+
+class ChatJoinRequest(BaseModel):
+    user_id: uuid.UUID = Field(..., description="UUID пользователя, который присоединяется")
+    invite_key: str = Field(..., description="Ключ приглашения")
+
+class ChatJoinResponse(BaseModel):
+    chat_id: uuid.UUID
+    user_id: uuid.UUID
+    joined_at: datetime
+    status: str = Field(..., description="Статус присоединения")
+
+class ChatMemberResponse(BaseModel):
+    user_id: uuid.UUID
+    nickname: str
+    joined_at: datetime
+
+class ChatDetailResponse(ChatResponse):
+    members: List[ChatMemberResponse] = Field(..., description="Список участников чата")
+
+class ChatLeaveResponse(BaseModel):
+    success: bool = Field(..., description="Успешность выхода из чата")
+    message: str = Field(..., description="Сообщение о результате")
+    chat_id: uuid.UUID
+
+class ChatLeaveAllResponse(BaseModel):
+    success: bool = Field(..., description="Успешность выхода из всех чатов")
+    message: str = Field(..., description="Сообщение о результате")
+    left_chats: int = Field(..., description="Количество покинутых чатов")
+
+class ChatMemberDetailedResponse(BaseModel):
+    user_id: uuid.UUID
+    nickname: str
+    public_key: str
+    joined_at: datetime
+    device_id: str = Field(..., description="Идентификатор устройства участника")
+
+class ChatMembersResponse(BaseModel):
+    chat_id: uuid.UUID
+    members: List[ChatMemberDetailedResponse] = Field(..., description="Детальный список участников")
+    total_members: int = Field(..., description="Общее количество участников")
+
+class ChatInviteRequest(BaseModel):
+    user_id: uuid.UUID = Field(..., description="UUID пользователя, которого приглашаем")
+
+app/schemas/user.py
+
+# app/schemas/user.py
+from pydantic import BaseModel, Field
+from typing import Optional
+import uuid
+
+class UserBase(BaseModel):
+    device_id: str = Field(..., min_length=1, max_length=255, description="Идентификатор устройства")
+    nickname: str = Field(..., min_length=1, max_length=50, description="Отображаемое имя пользователя")
+    public_key: str = Field(..., description="Публичный ключ в PEM формате")
+
+class UserCreate(UserBase):
+    pass
+
+class UserUpdate(BaseModel):
+    public_key: str = Field(..., description="Публичный ключ в PEM формате")
+
+class UserResponse(BaseModel):
+    user_id: uuid.UUID
+    device_id: str
+    nickname: str
+    public_key: str
+    
+    class Config:
+        from_attributes = True
+
+class UserPublicResponse(BaseModel):
+    user_id: uuid.UUID
+    nickname: str
+    public_key: str
+    
+    class Config:
+        from_attributes = True
+
+app/security.py
+
+
+
+app/websocket/manager.py
+
+# app/websocket/manager.py
+import asyncio
+import json
+from datetime import datetime
+import uuid
+from fastapi import WebSocket
+from typing import Dict, Optional
+import logging
+
+logger = logging.getLogger(__name__)
+
+class ConnectionManager:
+    def __init__(self):
+        # active_connections: {user_id: {"websocket": WebSocket, "nickname": str}}
+        self.active_connections: Dict[uuid.UUID, dict] = {}
+        self.offline_messages: Dict[uuid.UUID, list] = {}  # Очередь офлайн сообщений
+        
+    async def connect(self, websocket: WebSocket, user_id: uuid.UUID, nickname: str):
+        """Добавить новое соединение"""
+        # Закрываем старое соединение, если есть
+        if user_id in self.active_connections:
+            try:
+                old_connection = self.active_connections[user_id]["websocket"]
+                await old_connection.close(code=1000, reason="New connection from same user")
+            except:
+                pass
+        
+        self.active_connections[user_id] = {
+            "websocket": websocket,
+            "nickname": nickname,
+            "connected_at": datetime.now()
+        }
+        
+        logger.info(f"✅ User connected: {nickname} ({user_id})")
+        
+        # Отправляем офлайн сообщения, если есть
+        if user_id in self.offline_messages and self.offline_messages[user_id]:
+            await self.send_offline_messages(user_id)
+        
+        # Уведомляем контакты об онлайн статусе
+        await self.notify_contacts_online(user_id, True)
+    
+    async def disconnect(self, user_id: uuid.UUID):
+        """Удалить соединение"""
+        if user_id in self.active_connections:
+            nickname = self.active_connections[user_id]["nickname"]
+            del self.active_connections[user_id]
+            
+            logger.info(f"👋 User disconnected: {nickname} ({user_id})")
+            
+            # Уведомляем контакты об офлайн статусе
+            await self.notify_contacts_online(user_id, False)
+    
+    async def send_personal_message(self, message: dict, user_id: uuid.UUID):
+    
+        logger.info(f"📤 [Manager] Sending to user_id: {user_id}")
+        logger.info(f"   Message type: {message.get('type')}")
+    
+        if user_id in self.active_connections:
+            connection_info = self.active_connections[user_id]
+            logger.info(f"   User {connection_info['nickname']} is online")
+        
+            try:
+                websocket = connection_info["websocket"]
+                await websocket.send_json(message)
+                logger.info(f"✅ Message delivered to {connection_info['nickname']}")
+                return True
+            except Exception as e:
+                logger.error(f"❌ Error sending to {user_id}: {str(e)}")
+                await self.disconnect(user_id)
+                return False
+        else:
+            logger.warning(f"⚠️ User {user_id} is offline")
+            await self.save_offline_message(message, user_id)
+            return False
+    
+    
+    async def broadcast(self, message: dict):
+        """Отправить сообщение всем подключенным пользователям"""
+        disconnected_users = []
+        
+        for user_id, connection_data in self.active_connections.items():
+            try:
+                websocket = connection_data["websocket"]
+                await websocket.send_json(message)
+            except:
+                disconnected_users.append(user_id)
+        
+        # Удаляем отключенных пользователей
+        for user_id in disconnected_users:
+            await self.disconnect(user_id)
+    
+    async def send_to_chat(self, message: dict, chat_id: uuid.UUID, exclude_user_id: uuid.UUID = None):
+        """Отправить сообщение всем участникам чата (через внешний вызов)"""
+        # Этот метод будет вызываться из handle_chat_message
+        # Там уже есть логика получения участников чата
+        pass
+    
+    async def notify_contacts_online(self, user_id: uuid.UUID, is_online: bool):
+        """Уведомить контакты пользователя об изменении статуса"""
+        # TODO: Получить список контактов пользователя из БД
+        # Пока просто логируем
+        logger.info(f"User {user_id} is now {'online' if is_online else 'offline'}")
+    
+    async def save_offline_message(self, message: dict, user_id: uuid.UUID):
+        """Сохранить сообщение для офлайн пользователя"""
+        if user_id not in self.offline_messages:
+            self.offline_messages[user_id] = []
+        
+        # Ограничиваем очередь (последние 100 сообщений)
+        if len(self.offline_messages[user_id]) >= 100:
+            self.offline_messages[user_id].pop(0)
+        
+        self.offline_messages[user_id].append({
+            "message": message,
+            "timestamp": datetime.now().isoformat()
+        })
+        
+        logger.info(f"Offline message saved for user {user_id}")
+    
+    async def send_offline_messages(self, user_id: uuid.UUID):
+        """Отправить все офлайн сообщения пользователю"""
+        if user_id not in self.offline_messages or not self.offline_messages[user_id]:
+            return
+        
+        messages = self.offline_messages[user_id].copy()
+        self.offline_messages[user_id] = []
+        
+        logger.info(f"Sending {len(messages)} offline messages to user {user_id}")
+        
+        for msg_data in messages:
+            try:
+                await self.send_personal_message(msg_data["message"], user_id)
+                await asyncio.sleep(0.1)  # Небольшая задержка между сообщениями
+            except Exception as e:
+                logger.error(f"Error sending offline message: {str(e)}")
+    
+    def is_online(self, user_id: uuid.UUID) -> bool:
+        """Проверить, онлайн ли пользователь"""
+        return user_id in self.active_connections
+    
+    def get_online_users(self) -> list:
+        """Получить список онлайн пользователей"""
+        return [
+            {
+                "user_id": user_id,
+                "nickname": data["nickname"],
+                "connected_at": data["connected_at"]
+            }
+            for user_id, data in self.active_connections.items()
+        ]
+
+# Глобальный экземпляр менеджера
+manager = ConnectionManager()
+
