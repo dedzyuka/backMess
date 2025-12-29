@@ -10,8 +10,9 @@ app/api/routes/__init__.py
 
 from app.api.routes.user import router as users_router
 from app.api.routes.chat import router as chats_router
+from app.api.routes.contact import router as contact_router
 
-__all__ = ["users_router","chats_router"]
+__all__ = ["users_router","chats_router","contact_router"]
 
 app/api/routes/chat.py
 
@@ -389,6 +390,7 @@ async def invite_user_to_chat(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="You are not a member of this chat"
             )
+        
         # 4. Получаем приглашаемого пользователя
         user_id_str = invite_data.get("user_id")
         if not user_id_str:
@@ -412,23 +414,19 @@ async def invite_user_to_chat(
                 detail="Invited user not found"
             )
         
-        # 5. Проверяем, не является ли пользователь уже участником
-        # На этом устройстве
+        # 5. Проверяем, не является ли пользователь уже участником на этом устройстве
         if await chat_crud.is_user_chat_member(chat_id, invited_user_id, invited_user.device_id):
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="User is already a member of this chat on this device"
             )
         
-        # 6. Добавляем пользователя в чат
-        # Используем существующий метод join_chat, но с принудительным добавлением
-        join_data = ChatJoinRequest(
+        # 6. Добавляем пользователя в чат через invite_user_to_chat
+        result = await chat_crud.invite_user_to_chat(
+            chat_id=chat_id,
             user_id=invited_user_id,
-            invite_key=str(chat_id)  # Используем chat_id как invite_key для принудительного добавления
+            inviter_device_id=device_id
         )
-        
-        # Вызываем join_chat от имени приглашаемого пользователя
-        result = await chat_crud.join_chat(chat_id, join_data, invited_user.device_id) ####
         
         logger.info(f"User {invited_user.nickname} ({invited_user_id}) invited to chat {chat_id} by {inviting_user.nickname}")
         
@@ -452,6 +450,340 @@ async def invite_user_to_chat(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Internal server error: {str(e)}"
+        )
+
+app/api/routes/contact.py
+
+# app/api/routes/contact.py
+from fastapi import APIRouter, Depends, HTTPException, status, Header
+from sqlalchemy.ext.asyncio import AsyncSession
+import uuid
+import logging
+
+from app.crud.contact import ContactCRUD
+from app.crud.user import UserCRUD
+from app.database import get_db
+from app.schemas.contact import (
+    ContactRequestCreate,
+    ContactRequestResponse,
+    ContactRequestListResponse,
+    ContactResponse,
+    ContactListResponse
+)
+
+logger = logging.getLogger(__name__)
+router = APIRouter()
+
+async def get_device_id(x_device_id: str = Header(..., description="Идентификатор устройства")):
+    return x_device_id
+
+
+@router.post(
+    "/requests",
+    response_model=ContactRequestResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Отправить запрос на добавление в контакты",
+    response_description="Запрос на контакт создан"
+)
+async def create_contact_request(
+    request_data: ContactRequestCreate,
+    device_id: str = Depends(get_device_id),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Отправить запрос на добавление в контакты.
+    
+    - **to_user_id**: UUID пользователя, которому отправляем запрос
+    
+    Требует заголовок X-Device-ID с идентификатором устройства отправителя.
+    """
+    try:
+        user_crud = UserCRUD(db)
+        contact_crud = ContactCRUD(db)
+        
+        # Получаем отправителя по device_id
+        from_user = await user_crud.get_user_by_device_id(device_id)
+        if not from_user:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="User not found for this device"
+            )
+        
+        # Создаем запрос
+        contact_request = await contact_crud.create_contact_request(
+            from_user_id=from_user.user_id,
+            to_user_id=request_data.to_user_id
+        )
+        
+        # Получаем информацию о получателе
+        to_user = await user_crud.get_user(request_data.to_user_id)
+        
+        return ContactRequestResponse(
+            id=contact_request.id,
+            from_user_id=contact_request.from_user_id,
+            from_nickname=from_user.nickname,
+            to_user_id=contact_request.to_user_id,
+            to_nickname=to_user.nickname if to_user else "Unknown",
+            status=contact_request.status,
+            created_at=contact_request.created_at
+        )
+        
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )
+    except Exception as e:
+        logger.error(f"Error creating contact request: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Internal server error"
+        )
+
+@router.get(
+    "/requests/pending",
+    response_model=ContactRequestListResponse,
+    summary="Получить входящие запросы на контакт",
+    response_description="Список входящих запросов"
+)
+async def get_pending_contact_requests(
+    device_id: str = Depends(get_device_id),
+    db: AsyncSession = Depends(get_db)
+):
+    """Получить список входящих запросов на добавление в контакты"""
+    try:
+        user_crud = UserCRUD(db)
+        contact_crud = ContactCRUD(db)
+        
+        # Получаем текущего пользователя
+        current_user = await user_crud.get_user_by_device_id(device_id)
+        if not current_user:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="User not found for this device"
+            )
+        
+        # Получаем входящие запросы
+        requests = await contact_crud.get_pending_requests(current_user.user_id)
+        
+        # Формируем ответ
+        request_responses = []
+        for req in requests:
+            from_user = await user_crud.get_user(req.from_user_id)
+            request_responses.append(
+                ContactRequestResponse(
+                    id=req.id,
+                    from_user_id=req.from_user_id,
+                    from_nickname=from_user.nickname if from_user else "Unknown",
+                    to_user_id=req.to_user_id,
+                    to_nickname=current_user.nickname,
+                    status=req.status,
+                    created_at=req.created_at
+                )
+            )
+        
+        return ContactRequestListResponse(
+            requests=request_responses,
+            total_count=len(request_responses)
+        )
+        
+    except Exception as e:
+        logger.error(f"Error getting pending requests: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Internal server error"
+        )
+
+# app/api/routes/contact.py
+@router.post(
+    "/requests/{request_id}/respond",
+    response_model=ContactRequestResponse,
+    summary="Ответить на запрос на контакт",
+    response_description="Запрос обработан"
+)
+async def respond_to_contact_request(
+    request_id: uuid.UUID,
+    response_data: dict,  # {"status": "accepted" или "declined"}
+    device_id: str = Depends(get_device_id),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Принять или отклонить запрос на добавление в контакты.
+    
+    Тело запроса:
+    {
+        "status": "accepted" или "declined"
+    }
+    """
+    try:
+        logger.info(f"📥 POST /contacts/requests/{request_id}/respond")
+        logger.info(f"📥 Device ID: {device_id[:8]}...")
+        logger.info(f"📥 Request body: {response_data}")
+        logger.info(f"📥 Request ID: {request_id}")
+        
+        user_crud = UserCRUD(db)
+        contact_crud = ContactCRUD(db)
+        
+        # Получаем текущего пользователя
+        current_user = await user_crud.get_user_by_device_id(device_id)
+        if not current_user:
+            logger.warning(f"❌ User not found for device_id: {device_id[:8]}...")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="User not found for this device"
+            )
+        
+        logger.info(f"✅ Current user: {current_user.nickname} ({current_user.user_id})")
+        
+        status_value = response_data.get("status")
+        if status_value not in ["accepted", "declined"]:
+            logger.error(f"❌ Invalid status: {status_value}")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Status must be 'accepted' or 'declined'"
+            )
+        
+        logger.info(f"✅ Processing request {request_id} with status: {status_value}")
+        
+        # Обрабатываем запрос
+        contact_request = await contact_crud.respond_to_contact_request(
+            request_id=request_id,
+            responder_id=current_user.user_id,
+            status=status_value
+        )
+        
+        logger.info(f"✅ Request processed: {contact_request.status}")
+        
+        # Получаем информацию о пользователях
+        from_user = await user_crud.get_user(contact_request.from_user_id)
+        to_user = await user_crud.get_user(contact_request.to_user_id)
+        
+        response = ContactRequestResponse(
+            id=contact_request.id,
+            from_user_id=contact_request.from_user_id,
+            from_nickname=from_user.nickname if from_user else "Unknown",
+            to_user_id=contact_request.to_user_id,
+            to_nickname=to_user.nickname if to_user else "Unknown",
+            status=contact_request.status,
+            created_at=contact_request.created_at,
+            responded_at=contact_request.responded_at
+        )
+        
+        logger.info(f"✅ Response prepared: {response}")
+        return response
+        
+    except ValueError as e:
+        logger.error(f"❌ ValueError in respond_to_contact_request: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )
+    except Exception as e:
+        logger.error(f"❌ Error responding to contact request: {str(e)}")
+        import traceback
+        logger.error(f"❌ Traceback: {traceback.format_exc()}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Internal server error: {str(e)}"
+        )
+
+@router.get(
+    "/",
+    response_model=ContactListResponse,
+    summary="Получить список контактов",
+    response_description="Список контактов пользователя"
+)
+async def get_contacts(
+    device_id: str = Depends(get_device_id),
+    db: AsyncSession = Depends(get_db)
+):
+    """Получить список контактов текущего пользователя"""
+    try:
+        user_crud = UserCRUD(db)
+        contact_crud = ContactCRUD(db)
+        
+        # Получаем текущего пользователя
+        current_user = await user_crud.get_user_by_device_id(device_id)
+        if not current_user:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="User not found for this device"
+            )
+        
+        # Получаем контакты
+        contacts = await contact_crud.get_contacts(current_user.user_id)
+        
+        # Формируем ответ
+        contact_responses = []
+        for contact_user in contacts:
+            contact_responses.append(
+                ContactResponse(
+                    user_id=contact_user.user_id,
+                    nickname=contact_user.nickname,
+                    public_key=contact_user.public_key,
+                    created_at=contact_user.created_at
+                )
+            )
+        
+        return ContactListResponse(
+            contacts=contact_responses,
+            total_count=len(contact_responses)
+        )
+        
+    except Exception as e:
+        logger.error(f"Error getting contacts: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Internal server error"
+        )
+
+@router.delete(
+    "/{contact_user_id}",
+    status_code=status.HTTP_200_OK,
+    summary="Удалить контакт",
+    response_description="Контакт удален"
+)
+async def remove_contact(
+    contact_user_id: uuid.UUID,
+    device_id: str = Depends(get_device_id),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Удалить пользователя из контактов.
+    
+    - **contact_user_id**: UUID пользователя, которого удаляем из контактов
+    """
+    try:
+        user_crud = UserCRUD(db)
+        contact_crud = ContactCRUD(db)
+        
+        # Получаем текущего пользователя
+        current_user = await user_crud.get_user_by_device_id(device_id)
+        if not current_user:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="User not found for this device"
+            )
+        
+        # Удаляем контакт
+        success = await contact_crud.remove_contact(
+            user_id=current_user.user_id,
+            contact_user_id=contact_user_id
+        )
+        
+        if success:
+            return {"success": True, "message": "Contact removed"}
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Failed to remove contact"
+            )
+        
+    except Exception as e:
+        logger.error(f"Error removing contact: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Internal server error"
         )
 
 app/api/routes/user.py
@@ -831,6 +1163,7 @@ import json
 import logging
 from datetime import datetime
 
+from app.crud.contact import ContactCRUD
 from app.websocket.manager import ConnectionManager
 from app.database import get_db
 from app.crud.user import UserCRUD
@@ -856,7 +1189,7 @@ async def get_current_user(device_id: str, user_id: uuid.UUID, db: AsyncSession)
     
     return user
 
-@router.websocket("/ws/{user_id}")
+@router.websocket("/{user_id}")
 async def websocket_endpoint(
     websocket: WebSocket,
     user_id: uuid.UUID,
@@ -976,8 +1309,7 @@ async def handle_chat_message(data: dict, sender_id: uuid.UUID, db: AsyncSession
         logger.error(f"Error handling chat message: {str(e)}")
 
 # app/api/routes/websocket.py
-
-async def handle_contact_request(data: dict, websocket_user_id: uuid.UUID, db: AsyncSession):
+async def handle_contact_request(data: dict, sender_id: uuid.UUID, db: AsyncSession):
     """Обработать запрос на контакт"""
     try:
         # 1. Получаем recipient_id из сообщения
@@ -989,15 +1321,7 @@ async def handle_contact_request(data: dict, websocket_user_id: uuid.UUID, db: A
             
         recipient_id = uuid.UUID(recipient_id_str)
         
-        # 2. Получаем sender_id из сообщения, а не из URL!
-        sender_id_str = data.get("sender_id") or data.get("senderId")
-        if not sender_id_str:
-            # Если нет в сообщении, используем из URL (для обратной совместимости)
-            sender_id = websocket_user_id
-        else:
-            sender_id = uuid.UUID(sender_id_str)
-        
-        # 3. Проверяем, что отправитель не отправляет запрос самому себе
+        # 2. КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: Проверяем, что отправитель не отправляет запрос самому себе
         if sender_id == recipient_id:
             logger.warning(f"User {sender_id} tried to send contact request to themselves")
             # Отправляем ошибку отправителю
@@ -1009,7 +1333,7 @@ async def handle_contact_request(data: dict, websocket_user_id: uuid.UUID, db: A
             await manager.send_personal_message(error_msg, sender_id)
             return
         
-        # 4. Проверяем существование получателя
+        # 3. Проверяем существование получателя
         user_crud = UserCRUD(db)
         recipient = await user_crud.get_user(recipient_id)
         
@@ -1024,17 +1348,51 @@ async def handle_contact_request(data: dict, websocket_user_id: uuid.UUID, db: A
             await manager.send_personal_message(error_msg, sender_id)
             return
         
-        # 5. Получаем информацию об отправителе (из БД по ID из сообщения)
+        # 4. Получаем информацию об отправителе
         sender = await user_crud.get_user(sender_id)
         if not sender:
             logger.warning(f"Sender {sender_id} not found")
             return
         
-        # 6. Формируем запрос на контакт
-        request_id = data.get("request_id") or str(uuid.uuid4())
-        contact_request = {
+        # 5. Проверяем, не являются ли уже контактами
+        contact_crud = ContactCRUD(db)
+        try:
+            existing_contact = await contact_crud.get_contacts(sender_id)
+            for contact in existing_contact:
+                if contact.user_id == recipient_id:
+                    logger.warning(f"Users {sender_id} and {recipient_id} are already contacts")
+                    error_msg = {
+                        "type": "contact_request_error",
+                        "error": "Users are already contacts",
+                        "timestamp": datetime.now().isoformat()
+                    }
+                    await manager.send_personal_message(error_msg, sender_id)
+                    return
+        except:
+            pass
+        
+        # 6. Создаем запрос в БД
+        request_id = uuid.uuid4()
+        try:
+            contact_request = await contact_crud.create_contact_request(
+                from_user_id=sender_id,
+                to_user_id=recipient_id
+            )
+            request_id = contact_request.id
+        except ValueError as e:
+            logger.error(f"Failed to create contact request: {str(e)}")
+            error_msg = {
+                "type": "contact_request_error",
+                "error": str(e),
+                "timestamp": datetime.now().isoformat()
+            }
+            await manager.send_personal_message(error_msg, sender_id)
+            return
+        
+        # 7. Формируем запрос на контакт
+        contact_request_msg = {
             "type": "contact_request",
-            "request_id": request_id,
+            "request_id": str(request_id),
             "sender_id": str(sender_id),
             "sender_nickname": sender.nickname,
             "sender_public_key": sender.public_key,
@@ -1043,18 +1401,20 @@ async def handle_contact_request(data: dict, websocket_user_id: uuid.UUID, db: A
         
         logger.info(f"📤 Contact request: {sender.nickname} → {recipient.nickname}")
         
-        # 7. Отправляем получателю
-        await manager.send_personal_message(contact_request, recipient_id)
+        # 8. Отправляем ТОЛЬКО получателю
+        await manager.send_personal_message(contact_request_msg, recipient_id)
         
-        # 8. Отправляем подтверждение отправителю
+        # 9. Отправляем подтверждение отправителю (но не запрос!)
         await manager.send_personal_message({
             "type": "contact_request_sent",
             "recipient_id": str(recipient_id),
             "recipient_nickname": recipient.nickname,
-            "request_id": request_id,
+            "request_id": str(request_id),
             "timestamp": datetime.now().isoformat()
         }, sender_id)
-        logger.info(f"Sending contact request from {sender.nickname} ({sender_id}) to {recipient.nickname} ({recipient_id})")
+        
+        logger.info(f"✅ Contact request sent successfully")
+        
     except Exception as e:
         logger.error(f"Error handling contact request: {str(e)}")
 
@@ -1541,6 +1901,262 @@ class ChatCRUD:
             raise
     
 
+app/crud/contact.py
+
+# app/crud/contact.py
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, and_, or_, delete
+from sqlalchemy.exc import SQLAlchemyError, IntegrityError
+from app.models.contact import ContactRequest, Contact
+from app.models.user import User
+import uuid
+import logging
+from datetime import datetime
+
+logger = logging.getLogger(__name__)
+
+class ContactCRUD:
+    def __init__(self, db: AsyncSession):
+        self.db = db
+    
+    async def create_contact_request(self, from_user_id: uuid.UUID, to_user_id: uuid.UUID, request_id: uuid.UUID = None) -> ContactRequest:
+        """Создать запрос на добавление в контакты"""
+        try:
+            logger.info(f"CRUD: Creating contact request from {from_user_id} to {to_user_id}")
+            
+            if request_id is None:
+                request_id = uuid.uuid4()
+            
+            logger.info(f"CRUD: Using request_id: {request_id}")
+            
+            # Проверяем, что пользователи существуют
+            from_user_query = select(User).where(User.user_id == from_user_id)
+            to_user_query = select(User).where(User.user_id == to_user_id)
+            
+            from_user = (await self.db.execute(from_user_query)).scalar_one_or_none()
+            to_user = (await self.db.execute(to_user_query)).scalar_one_or_none()
+            
+            if not from_user or not to_user:
+                raise ValueError("One or both users not found")
+            
+            # Проверяем, что запрос не самому себе
+            if from_user_id == to_user_id:
+                raise ValueError("Cannot send contact request to yourself")
+            
+            # Проверяем, не существует ли уже запрос с таким ID
+            existing_id_query = select(ContactRequest).where(
+                ContactRequest.id == request_id
+            )
+            existing_id_request = (await self.db.execute(existing_id_query)).scalar_one_or_none()
+            
+            if existing_id_request:
+                logger.warning(f"CRUD: Request with ID {request_id} already exists")
+                return existing_id_request
+            
+            # Проверяем, не существует ли уже запрос между этими пользователями
+            existing_request_query = select(ContactRequest).where(
+                and_(
+                    ContactRequest.from_user_id == from_user_id,
+                    ContactRequest.to_user_id == to_user_id,
+                    ContactRequest.status == "pending"
+                )
+            )
+            existing_request = (await self.db.execute(existing_request_query)).scalar_one_or_none()
+            
+            if existing_request:
+                logger.warning(f"CRUD: Request already exists between these users: {existing_request.id}")
+                return existing_request
+            
+            # Проверяем, не являются ли уже контактами
+            existing_contact_query = select(Contact).where(
+                or_(
+                    and_(
+                        Contact.user_id == from_user_id,
+                        Contact.contact_user_id == to_user_id
+                    ),
+                    and_(
+                        Contact.user_id == to_user_id,
+                        Contact.contact_user_id == from_user_id
+                    )
+                )
+            )
+            existing_contact = (await self.db.execute(existing_contact_query)).scalar_one_or_none()
+            
+            if existing_contact:
+                raise ValueError("Users are already contacts")
+            
+            # Создаем запрос с указанным ID
+            contact_request = ContactRequest(
+                id=request_id,  # Используем переданный ID!
+                from_user_id=from_user_id,
+                to_user_id=to_user_id,
+                status="pending"
+            )
+            
+            self.db.add(contact_request)
+            await self.db.commit()
+            await self.db.refresh(contact_request)
+            
+            logger.info(f"CRUD: Contact request created with ID: {contact_request.id}")
+            return contact_request
+            
+        except IntegrityError as e:
+            await self.db.rollback()
+            logger.error(f"CRUD: Integrity error creating contact request: {str(e)}")
+            raise ValueError("Failed to create contact request")
+        except SQLAlchemyError as e:
+            await self.db.rollback()
+            logger.error(f"CRUD: Database error creating contact request: {str(e)}")
+            raise RuntimeError("Database error during contact request creation")
+    
+    async def get_pending_requests(self, user_id: uuid.UUID) -> list[ContactRequest]:
+        """Получить входящие запросы на контакт"""
+        try:
+            query = select(ContactRequest).where(
+                and_(
+                    ContactRequest.to_user_id == user_id,
+                    ContactRequest.status == "pending"
+                )
+            ).order_by(ContactRequest.created_at.desc())
+            
+            result = await self.db.execute(query)
+            return result.scalars().all()
+        except SQLAlchemyError as e:
+            logger.error(f"Error getting pending requests: {str(e)}")
+            raise
+    
+    async def respond_to_contact_request(
+        self, 
+        request_id: uuid.UUID, 
+        responder_id: uuid.UUID, 
+        status: str
+    ) -> ContactRequest:
+        """Ответить на запрос на контакт (принять/отклонить)"""
+        try:
+            logger.info(f"CRUD: Responding to request {request_id} with status {status}")
+            
+            if status not in ["accepted", "declined"]:
+                raise ValueError("Status must be 'accepted' or 'declined'")
+            
+            # Используем правильное имя столбца: to_user_id
+            query = select(ContactRequest).where(
+                and_(
+                    ContactRequest.id == request_id,
+                    ContactRequest.to_user_id == responder_id,  # Только получатель может ответить
+                    ContactRequest.status == "pending"
+                )
+            )
+            
+            result = await self.db.execute(query)
+            contact_request = result.scalar_one_or_none()
+            
+            logger.info(f"CRUD: Found request: {contact_request}")
+            
+            if not contact_request:
+                raise ValueError("Contact request not found or already processed")
+            
+            # Обновляем статус
+            contact_request.status = status
+            contact_request.updated_at = datetime.utcnow()
+            contact_request.responded_at = datetime.utcnow()
+            
+            # Если приняли, создаем контакт для обоих пользователей
+            if status == "accepted":
+                logger.info(f"CRUD: Creating contacts between {contact_request.from_user_id} and {contact_request.to_user_id}")
+                
+                # Проверяем, не существует ли уже контакта
+                existing_contact_query = select(Contact).where(
+                    or_(
+                        and_(
+                            Contact.user_id == contact_request.from_user_id,
+                            Contact.contact_user_id == contact_request.to_user_id
+                        ),
+                        and_(
+                            Contact.user_id == contact_request.to_user_id,
+                            Contact.contact_user_id == contact_request.from_user_id
+                        )
+                    )
+                )
+                existing_result = await self.db.execute(existing_contact_query)
+                existing_contact = existing_result.scalar_one_or_none()
+                
+                if existing_contact:
+                    logger.warning(f"CRUD: Contact already exists between these users")
+                else:
+                    # Контакт для инициатора
+                    contact1 = Contact(
+                        user_id=contact_request.from_user_id,
+                        contact_user_id=contact_request.to_user_id
+                    )
+                    
+                    # Контакт для получателя
+                    contact2 = Contact(
+                        user_id=contact_request.to_user_id,
+                        contact_user_id=contact_request.from_user_id
+                    )
+                    
+                    self.db.add_all([contact1, contact2])
+                    logger.info(f"CRUD: Contacts created")
+            
+            await self.db.commit()
+            await self.db.refresh(contact_request)
+            
+            logger.info(f"CRUD: Request {request_id} {status} by {responder_id}")
+            return contact_request
+            
+        except IntegrityError as e:
+            await self.db.rollback()
+            logger.error(f"CRUD: Integrity error responding to contact request: {str(e)}")
+            raise ValueError("Failed to respond to contact request - integrity error")
+        except SQLAlchemyError as e:
+            await self.db.rollback()
+            logger.error(f"CRUD: Database error responding to contact request: {str(e)}")
+            raise RuntimeError("Database error during contact request response")
+    
+    async def get_contacts(self, user_id: uuid.UUID) -> list[User]:
+        """Получить список контактов пользователя"""
+        try:
+            query = select(User).join(
+                Contact, Contact.contact_user_id == User.user_id
+            ).where(
+                Contact.user_id == user_id
+            ).order_by(User.nickname)
+            
+            result = await self.db.execute(query)
+            return result.scalars().all()
+        except SQLAlchemyError as e:
+            logger.error(f"Error getting contacts: {str(e)}")
+            raise
+    
+    async def remove_contact(self, user_id: uuid.UUID, contact_user_id: uuid.UUID) -> bool:
+        """Удалить контакт (для обоих пользователей)"""
+        try:
+            # Удаляем контакт в обе стороны
+            delete_query1 = delete(Contact).where(
+                and_(
+                    Contact.user_id == user_id,
+                    Contact.contact_user_id == contact_user_id
+                )
+            )
+            
+            delete_query2 = delete(Contact).where(
+                and_(
+                    Contact.user_id == contact_user_id,
+                    Contact.contact_user_id == user_id
+                )
+            )
+            
+            await self.db.execute(delete_query1)
+            await self.db.execute(delete_query2)
+            await self.db.commit()
+            
+            logger.info(f"Contact removed between {user_id} and {contact_user_id}")
+            return True
+        except SQLAlchemyError as e:
+            await self.db.rollback()
+            logger.error(f"Error removing contact: {str(e)}")
+            raise
+
 app/crud/user.py
 
 # app/crud/user.py
@@ -1756,8 +2372,9 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 
-from app.api.routes import users_router, chats_router
+from app.api.routes import users_router, chats_router, contact_router
 from app.api.routes.websocket import router as websocket_router
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -1809,6 +2426,11 @@ app.include_router(
     prefix="/ws",
     tags=["websocket"]
 )
+app.include_router(
+    contact_router,
+    prefix="/api/v1/contacts",
+    tags=["contacts"]
+)
 
 @app.get("/")
 async def root():
@@ -1856,8 +2478,9 @@ app/models/__init__.py
 # app/models/__init__.py
 from app.models.user import User
 from app.models.chat import Chat, ChatMember
+from app.models.contact import ContactRequest,Contact
 
-__all__ = ["User", "Chat", "ChatMember"]
+__all__ = ["User", "Chat", "ChatMember","ContactRequest","Contact"]
 
 app/models/chat.py
 
@@ -1929,6 +2552,94 @@ class ChatMember(Base):
     chat = relationship("Chat", back_populates="members")
     user = relationship("User")
 
+app/models/contact.py
+
+from sqlalchemy import String, DateTime, ForeignKey, UniqueConstraint
+from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+import uuid
+from datetime import datetime
+from app.database import Base
+
+class ContactRequest(Base):
+    __tablename__ = "contact_requests"
+    
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), 
+        primary_key=True, 
+        default=uuid.uuid4
+    )
+    from_user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), 
+        ForeignKey("users.user_id", ondelete="CASCADE"), 
+        nullable=False,
+        index=True
+    )
+    to_user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), 
+        ForeignKey("users.user_id", ondelete="CASCADE"), 
+        nullable=False,
+        index=True
+    )
+    status: Mapped[str] = mapped_column(
+        String(20), 
+        nullable=False, 
+        default="pending"
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, 
+        default=datetime.utcnow, 
+        nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, 
+        default=datetime.utcnow, 
+        onupdate=datetime.utcnow,
+        nullable=False
+    )
+    
+    # Relationships
+    from_user = relationship("User", foreign_keys=[from_user_id])
+    to_user = relationship("User", foreign_keys=[to_user_id])
+    
+    __table_args__ = (
+        UniqueConstraint('from_user_id', 'to_user_id', name='uq_contact_request_from_to'),
+    )
+
+class Contact(Base):
+    __tablename__ = "contacts"
+    
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), 
+        primary_key=True, 
+        default=uuid.uuid4
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), 
+        ForeignKey("users.user_id", ondelete="CASCADE"), 
+        nullable=False,
+        index=True
+    )
+    contact_user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), 
+        ForeignKey("users.user_id", ondelete="CASCADE"), 
+        nullable=False,
+        index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, 
+        default=datetime.utcnow, 
+        nullable=False
+    )
+    
+    # Relationships
+    user = relationship("User", foreign_keys=[user_id])
+    contact_user = relationship("User", foreign_keys=[contact_user_id])
+    
+    __table_args__ = (
+        UniqueConstraint('user_id', 'contact_user_id', name='uq_user_contact'),
+    )
+
 app/models/user.py
 
 # app/models/user.py
@@ -1988,6 +2699,7 @@ from app.schemas.chat import (
     ChatMemberDetailedResponse,
     ChatMembersResponse
 )
+from app.schemas.contact import ContactListResponse,ContactRequestCreate,ContactRequestListResponse,ContactRequestResponse,ContactResponse
 
 __all__ = [
     "UserCreate", "UserResponse","UserUpdate",
@@ -1995,6 +2707,8 @@ __all__ = [
     "ChatJoinRequest", "ChatJoinResponse", "ChatMemberResponse",
     "ChatLeaveResponse", "ChatLeaveAllResponse", 
     "ChatMemberDetailedResponse", "ChatMembersResponse","UserPublicResponse"
+,"ContactListResponse","ContactRequestCreate","ContactRequestListResponse","ContactRequestResponse","ContactResponse"
+
 ]
 
 
@@ -2068,6 +2782,44 @@ class ChatMembersResponse(BaseModel):
 
 class ChatInviteRequest(BaseModel):
     user_id: uuid.UUID = Field(..., description="UUID пользователя, которого приглашаем")
+
+app/schemas/contact.py
+
+# app/schemas/contact.py
+from pydantic import BaseModel, Field
+from typing import List, Optional
+import uuid
+from datetime import datetime
+
+class ContactRequestCreate(BaseModel):
+    to_user_id: uuid.UUID = Field(..., description="UUID пользователя, которому отправляем запрос")
+
+class ContactRequestResponse(BaseModel):
+    id: uuid.UUID
+    from_user_id: uuid.UUID
+    from_nickname: str
+    to_user_id: uuid.UUID
+    to_nickname: str
+    status: str = Field(..., description="pending, accepted, declined")
+    created_at: datetime
+    responded_at: Optional[datetime] = None
+
+class ContactRequestListResponse(BaseModel):
+    requests: List[ContactRequestResponse]
+    total_count: int
+
+class ContactResponse(BaseModel):
+    user_id: uuid.UUID
+    nickname: str
+    public_key: str
+    created_at: datetime
+    
+    class Config:
+        from_attributes = True
+
+class ContactListResponse(BaseModel):
+    contacts: List[ContactResponse]
+    total_count: int
 
 app/schemas/user.py
 
